@@ -1,8 +1,8 @@
 use crate::{dispatcher, Error, Packet, Result, Settings};
 use futures::TryFutureExt;
 use semtech_udp::{
-    server_runtime::{Error as SemtechError, Event, UdpRuntime},
-    tx_ack, MacAddress,
+    server_runtime::{Error as SemtechError, Event, UdpRuntime, RxPk},
+    tx_ack, MacAddress, push_data::RxPkV3, push_data_sig,
 };
 use slog::{debug, info, o, warn, Logger};
 use std::{convert::TryFrom, time::Duration};
@@ -40,6 +40,7 @@ pub struct Gateway {
     downlink_mac: MacAddress,
     udp_runtime: UdpRuntime,
     listen_address: String,
+    signed_pkt_queue: Vec<RxPkV3>,
 }
 
 impl Gateway {
@@ -54,6 +55,7 @@ impl Gateway {
             messages,
             listen_address: settings.listen.clone(),
             udp_runtime: UdpRuntime::new(&settings.listen).await?,
+            signed_pkt_queue: Vec::new(),
         };
         Ok(gateway)
     }
@@ -98,18 +100,36 @@ impl Gateway {
             Event::ClientDisconnected((mac, addr)) => {
                 info!(logger, "disconnected packet forwarder: {mac}, {addr}")
             }
-            Event::PacketReceived(rxpk, _gateway_mac) => match Packet::try_from(rxpk) {
-                Ok(mut packet) => {
-                    if packet.poc_payload().is_some() {
-                        self.handle_poc_packet(logger, packet).await;
-                    } else {
-                        self.handle_uplink(logger, packet).await;
+            Event::PacketReceived(rxpk, _gateway_mac) => {
+
+                let v3pkt = match rxpk.clone() {
+                    RxPk::V3(v3pkt) => Some(v3pkt),
+                    _ => None,
+                };
+
+                match Packet::try_from(rxpk) {
+                    Ok(mut packet) => {
+                        if packet.poc_payload().is_some() {
+                            self.handle_poc_packet(logger, packet).await;
+
+                            if let Some(v3pkt) = v3pkt {
+                                self.queue_signed_poc_packet(v3pkt).await;
+                            }
+                            
+                        } else {
+                            self.handle_uplink(logger, packet).await;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(logger, "ignoring push_data: {err:?}");
                     }
                 }
-                Err(err) => {
-                    warn!(logger, "ignoring push_data: {err:?}");
-                }
-            },
+
+            }
+            
+            Event::PacketSigReceived(sigpkt, gateway_mac) => {
+                self.handle_pkt_sig(sigpkt).await;
+            }
             Event::NoClientWithMac(_packet, mac) => {
                 info!(logger, "ignoring send to client with unknown MAC: {mac}")
             }
@@ -133,6 +153,22 @@ impl Gateway {
             Ok(()) => (),
             Err(err) => warn!(logger, "ignoring uplink error {:?}", err),
         }
+    }
+
+    async fn queue_signed_poc_packet(&mut self, packet: RxPkV3) {
+        if self.signed_pkt_queue.len() > 5 {
+            self.signed_pkt_queue.remove(0);
+        }
+        self.signed_pkt_queue.push(packet);
+        
+    }
+
+    async fn handle_pkt_sig(&mut self, sig_pkt: push_data_sig::Packet) {
+        if let Some(idx) = self.signed_pkt_queue.iter().position(|pkt| pkt.key == sig_pkt.data.key ) {
+            let original_pkt = self.signed_pkt_queue.remove(idx);
+
+        }
+
     }
 
     async fn handle_message(&mut self, logger: &Logger, message: Message) {

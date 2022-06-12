@@ -60,7 +60,7 @@ impl TryFrom<push_data::RxPk> for Packet {
                 r#type: PacketType::Lorawan.into(),
                 signal_strength: rssi as f32,
                 snr: rxpk.get_snr() as f32,
-                frequency: *rxpk.get_frequency() as f32,
+                frequency: rxpk.get_frequency() as f32,
                 timestamp: *rxpk.get_timestamp() as u64,
                 datarate: rxpk.get_datarate().to_string(),
                 routing: Self::routing_information(&Self::parse_frame(
