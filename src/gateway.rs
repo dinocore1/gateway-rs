@@ -140,6 +140,9 @@ impl Gateway {
                     warn!(logger, "ignoring push_data: {err:?}");
                 }
             },
+            Event::PacketSigReceived(rxpk, _gateway_mac) => {
+                self.beacon_handler.received_packet_sig(rxpk).await
+            },
             Event::NoClientWithMac(_packet, mac) => {
                 info!(logger, "ignoring send to client with unknown MAC: {mac}")
             }

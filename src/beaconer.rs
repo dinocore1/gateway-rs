@@ -13,7 +13,7 @@ use crate::{
 use futures::TryFutureExt;
 use helium_proto::services::poc_lora;
 use slog::{self, info, warn, Logger};
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration, collections::VecDeque};
 use tokio::time;
 use triggered::Listener;
 
@@ -21,6 +21,7 @@ use triggered::Listener;
 #[derive(Debug)]
 pub enum Message {
     ReceivedBeacon(Packet),
+    ReceivedPacketSig(semtech_udp::push_data_sig::Packet),
     RegionParamsChanged(RegionParams),
 }
 
@@ -36,6 +37,14 @@ impl MessageSender {
         let _ = self
             .0
             .send(Message::ReceivedBeacon(packet))
+            .map_err(|_| Error::channel())
+            .await;
+    }
+
+    pub async fn received_packet_sig(&self, packet: semtech_udp::push_data_sig::Packet) {
+        let _ = self
+            .0
+            .send(Message::ReceivedPacketSig(packet))
             .map_err(|_| Error::channel())
             .await;
     }
@@ -62,6 +71,7 @@ pub struct Beaconer {
     region_params: Option<RegionParams>,
     poc_service: PocLoraService,
     entropy_service: EntropyService,
+    secure_packets: VecDeque<Packet>,
 }
 
 impl Beaconer {
@@ -83,6 +93,7 @@ impl Beaconer {
             region_params: None,
             poc_service,
             entropy_service,
+            secure_packets: VecDeque::with_capacity(10),
         }
     }
 
@@ -132,6 +143,7 @@ impl Beaconer {
     async fn handle_message(&mut self, message: Message, logger: &Logger) {
         match message {
             Message::ReceivedBeacon(packet) => self.handle_received_beacon(packet, logger).await,
+            Message::ReceivedPacketSig(packet) => self.handle_packet_sig(packet, logger).await,
             Message::RegionParamsChanged(region_params) => {
                 self.handle_region_params(region_params, logger)
             }
@@ -140,6 +152,23 @@ impl Beaconer {
 
     async fn handle_received_beacon(&mut self, packet: Packet, logger: &Logger) {
         info!(logger, "received possible PoC payload: {packet:?}");
+        if packet.is_secure_packet() {
+            // Queue up secure packets and wait for their signatures to come in later
+
+            if is_full(&self.secure_packets) {
+                // our packet stash is full, pop off oldest and submit
+                let old_packet = self.secure_packets.pop_front().unwrap();
+                self.submit_witness(old_packet, logger).await;
+            }
+            self.secure_packets.push_back(packet.clone());
+        } else {
+            // its not a secure packet so there will be no future signature
+            self.submit_witness(packet, logger).await;
+        }
+        
+    }
+
+    async fn submit_witness(&mut self, packet: Packet, logger: &Logger) {
         let report = match packet.to_witness_report() {
             Ok(report) => report,
             Err(err) => {
@@ -153,6 +182,20 @@ impl Beaconer {
             .inspect_err(|err| info!(logger, "failed to submit poc witness report: {err:?}"; "beacon" => report.data.to_b64()))
             .inspect_ok(|_| info!(logger, "poc witness report submitted"; "beacon" => report.data.to_b64()))
             .await;
+    }
+
+    async fn handle_packet_sig(&mut self, packet: semtech_udp::push_data_sig::Packet, logger: &Logger) {
+        info!(logger, "received secure packet signature packet: {packet:?}");
+
+        match self.secure_packets.iter().position(|x| x.packet_key().map_or(false, |k| k == packet.data.key) ) {
+            Some(i) => {
+                let mut poc_packet = self.secure_packets.remove(i).unwrap();
+                poc_packet.set_secure_sig(packet.data.sig);
+                self.submit_witness(poc_packet, logger).await;
+            }
+
+            None => warn!(logger, "can not find secure packet with key: {}", packet.data.key)
+        }
     }
 
     fn handle_region_params(&mut self, params: RegionParams, logger: &Logger) {
@@ -193,6 +236,10 @@ impl Beaconer {
             }
         }
     }
+}
+
+fn is_full<T>(l: &VecDeque<T>) -> bool {
+    l.capacity() - l.len() == 0
 }
 
 #[test]
