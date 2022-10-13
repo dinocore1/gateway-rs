@@ -12,7 +12,7 @@ use semtech_udp::{
     CodingRate, DataRate, Modulation, StringOrNum, MacAddress,
 };
 use sha2::{Digest, Sha256};
-use std::{convert::TryFrom, fmt::{self, Display}, ops::Deref, str::FromStr};
+use std::{convert::TryFrom, fmt::{self, Display}, str::FromStr};
 
 /// Frequency (hz)
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +80,10 @@ impl Rssi {
 
     fn dbm(&self) -> i32 {
         self.0
+    }
+
+    fn centi_dbm(&self) -> i32 {
+        self.0 * 10
     }
 }
 
@@ -166,7 +170,7 @@ impl TryFrom<push_data::RxPk> for Packet {
                     rxpk.get_data(),
                 )?)?,
                 oui: 0,
-                packet_type: PacketType::Lorawan,
+                packet_type: PacketType::Lorawan.into(),
                 rx2_window: None,
                 key: key,
                 pos: pos,
@@ -381,8 +385,8 @@ impl Packet {
             data: payload,
             timestamp: self.tmst.into(),
             ts_res: 0,
-            signal: 0,
-            snr: self.snr.db(),
+            signal: self.rssi.centi_dbm(),
+            snr: self.snr.centi_db(),
             frequency: self.freq.hz().into(),
             datarate: dr as i32,
             signature: vec![],

@@ -829,6 +829,7 @@ dependencies = [
  "base64",
  "beacon",
  "bytes",
+ "cfg-if 1.0.0",
  "config",
  "daemonize",
  "exponential-backoff",
@@ -1002,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "helium-proto"
 version = "0.1.0"
-source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#fcd22ef2674649262dd62e0b5d3eaf1a871bcd00"
+source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#b290ae234ef136b9fd67121a11a8163870f1faca"
 dependencies = [
  "bytes",
  "prost",
