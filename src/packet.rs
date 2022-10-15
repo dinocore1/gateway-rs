@@ -7,7 +7,7 @@ use helium_proto::{
 use lorawan::{Direction, PHYPayloadFrame, MHDR};
 use nlighten::gps::{WGS84Position, GPSTime};
 use semtech_udp::{
-    pull_resp,
+    pull_resp::{self, PhyData},
     push_data::{self, CRC},
     CodingRate, DataRate, Modulation, StringOrNum, MacAddress,
 };
@@ -19,9 +19,6 @@ use std::{convert::TryFrom, fmt::{self, Display}, str::FromStr};
 struct Frequency(u32);
 
 impl Frequency {
-    fn from_hz(hz: u32) -> Self {
-        Self(hz)
-    }
 
     fn from_mhz(mhz: f64) -> Self {
         Self((mhz * 1_000_000_f64).trunc() as u32)
@@ -160,7 +157,6 @@ impl TryFrom<push_data::RxPk> for Packet {
             let packet = Self {
                 tmst: *rxpk.get_timestamp(),
                 datr: rxpk.get_datarate(),
-                payload: rxpk.get_data().to_vec(),
                 rssi: Rssi::from_dbm(rssi),
                 snr: Snr::from_db(rxpk.get_snr()),
                 freq: Frequency::from_mhz(rxpk.get_frequency()),
@@ -169,15 +165,15 @@ impl TryFrom<push_data::RxPk> for Packet {
                     lorawan::Direction::Uplink,
                     rxpk.get_data(),
                 )?)?,
+                payload: rxpk.get_data().to_vec(),
+                rx2_window: None,
                 oui: 0,
                 packet_type: PacketType::Lorawan.into(),
-                rx2_window: None,
                 key: key,
                 pos: pos,
                 gps_time: gps_time,
                 concentrator_sig: None,
             };
-
             Ok(packet)
         } else {
             Err(DecodeError::invalid_crc())
@@ -286,8 +282,7 @@ impl Packet {
             // for normal lorawan packets we're not selecting different frequencies
             // like we are for PoC
             freq: frequency as f64,
-            data: self.payload.clone(),
-            size: self.payload.len() as u64,
+            data: PhyData::new(self.payload.clone()),
             powe: tx_power as u64,
             rfch: 0,
             tmst: match timestamp {
@@ -302,7 +297,6 @@ impl Packet {
     }
 
     pub fn from_state_channel_response(response: BlockchainStateChannelResponseV1) -> Option<Self> {
-
         response.downlink.map(Self::from)
     }
 

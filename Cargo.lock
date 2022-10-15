@@ -214,7 +214,7 @@ dependencies = [
  "rand_chacha",
  "serde",
  "serde_json",
- "sha2 0.9.9",
+ "sha2 0.10.6",
  "thiserror",
 ]
 
@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "helium-proto"
 version = "0.1.0"
-source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#b290ae234ef136b9fd67121a11a8163870f1faca"
+source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#34110f7ae47eabfa15bad52fd535c41f69c41639"
 dependencies = [
  "bytes",
  "prost",
@@ -1972,8 +1972,8 @@ dependencies = [
 
 [[package]]
 name = "semtech-udp"
-version = "0.9.8-alpha.0"
-source = "git+https://github.com/dinocore1/semtech-udp.git?branch=secure_concentrator#bea53ae3ba17e34ce1c3c67dc3f7c8718b619288"
+version = "0.10.3"
+source = "git+https://github.com/dinocore1/semtech-udp.git?branch=secure_concentrator#4b34bb288d653c1800f19bde7e213244d41203da"
 dependencies = [
  "arrayref",
  "base64",
