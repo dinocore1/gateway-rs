@@ -14,82 +14,6 @@ use semtech_udp::{
 use sha2::{Digest, Sha256};
 use std::{convert::TryFrom, fmt::{self, Display}, str::FromStr};
 
-/// Frequency (hz)
-#[derive(Debug, Clone, Copy)]
-struct Frequency(u32);
-
-impl Frequency {
-
-    fn from_mhz(mhz: f64) -> Self {
-        Self((mhz * 1_000_000_f64).trunc() as u32)
-    }
-
-    fn hz(&self) -> u32 {
-        self.0
-    }
-
-    fn to_mhz(&self) -> f32 {
-        self.0 as f32 / 1_000_000_f32
-    }
-}
-
-impl Display for Frequency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.2} MHz", self.to_mhz())
-    }
-}
-
-/// Signal to Noise Ratio (0.01dB)
-#[derive(Debug, Clone, Copy)]
-struct Snr(i32);
-
-impl Snr {
-
-    fn from_db(db: f32) -> Self {
-        Self((db * 10_f32).trunc() as i32)
-    }
-
-    fn centi_db(&self) -> i32 {
-        self.0
-    }
-
-    fn db(&self) -> f32 {
-        self.0 as f32 / 10_f32
-    }
-
-}
-
-impl Display for Snr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.1} dB", self.db())
-    }
-}
-
-/// RSSI (dBm)
-#[derive(Debug, Clone, Copy)]
-struct Rssi(i32);
-
-impl Rssi {
-
-    fn from_dbm(dbm: i32) -> Self {
-        Self(dbm)
-    }
-
-    fn dbm(&self) -> i32 {
-        self.0
-    }
-
-    fn centi_dbm(&self) -> i32 {
-        self.0 * 10
-    }
-}
-
-impl Display for Rssi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} dBm", self.dbm())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Packet {
     /// Internal timestamp of "RX finished" event (32b unsigned)
@@ -419,5 +343,81 @@ fn convert_gps_time(input: GPSTime) -> poc_lora::GpsTime {
     poc_lora::GpsTime {
         sec: duration.as_secs(),
         nano: duration.subsec_nanos(),
+    }
+}
+
+/// Frequency (hz)
+#[derive(Debug, Clone, Copy)]
+struct Frequency(u32);
+
+impl Frequency {
+
+    fn from_mhz(mhz: f64) -> Self {
+        Self((mhz * 1_000_000_f64).trunc() as u32)
+    }
+
+    fn hz(&self) -> u32 {
+        self.0
+    }
+
+    fn to_mhz(&self) -> f32 {
+        self.0 as f32 / 1_000_000_f32
+    }
+}
+
+impl Display for Frequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.2} MHz", self.to_mhz())
+    }
+}
+
+/// Signal to Noise Ratio (0.01dB)
+#[derive(Debug, Clone, Copy)]
+struct Snr(i32);
+
+impl Snr {
+
+    fn from_db(db: f32) -> Self {
+        Self((db * 10_f32).trunc() as i32)
+    }
+
+    fn centi_db(&self) -> i32 {
+        self.0
+    }
+
+    fn db(&self) -> f32 {
+        self.0 as f32 / 10_f32
+    }
+
+}
+
+impl Display for Snr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.1} dB", self.db())
+    }
+}
+
+/// RSSI (dBm)
+#[derive(Debug, Clone, Copy)]
+struct Rssi(i32);
+
+impl Rssi {
+
+    fn from_dbm(dbm: i32) -> Self {
+        Self(dbm)
+    }
+
+    fn dbm(&self) -> i32 {
+        self.0
+    }
+
+    fn centi_dbm(&self) -> i32 {
+        self.0 * 10
+    }
+}
+
+impl Display for Rssi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} dBm", self.dbm())
     }
 }
