@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "helium-proto"
 version = "0.1.0"
-source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#34110f7ae47eabfa15bad52fd535c41f69c41639"
+source = "git+https://github.com/dinocore1/proto.git?branch=secure_concentrator#845add8c8c6ee1d32d3f74813a6c4cf0178003a9"
 dependencies = [
  "bytes",
  "prost",

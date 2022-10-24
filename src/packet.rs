@@ -79,6 +79,7 @@ impl TryFrom<push_data::RxPk> for Packet {
             };
 
             let packet = Self {
+                packet_type: PacketType::Lorawan.into(),
                 tmst: *rxpk.get_timestamp(),
                 datr: rxpk.get_datarate(),
                 rssi: Rssi::from_dbm(rssi),
@@ -92,7 +93,6 @@ impl TryFrom<push_data::RxPk> for Packet {
                 payload: rxpk.get_data().to_vec(),
                 rx2_window: None,
                 oui: 0,
-                packet_type: PacketType::Lorawan.into(),
                 key: key,
                 pos: pos,
                 gps_time: gps_time,
@@ -301,8 +301,11 @@ impl Packet {
         let report = poc_lora::LoraWitnessReportReqV1 {
             pub_key: vec![],
             data: payload,
-            timestamp: self.tmst.into(),
-            ts_res: 0,
+            tmst: self.timestamp as u32,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(Error::from)?
+                .as_nanos() as u64,
             signal: self.rssi.centi_dbm(),
             snr: self.snr.centi_db(),
             frequency: self.freq.hz().into(),
