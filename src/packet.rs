@@ -1,18 +1,22 @@
 use crate::{error::DecodeError, Error, Result};
 use helium_proto::{
     packet::PacketType, routing_information::Data as RoutingData, services::poc_lora,
-    BlockchainStateChannelResponseV1, DataRate as ProtoDataRate, Eui, RoutingInformation,
-    Window,
+    BlockchainStateChannelResponseV1, DataRate as ProtoDataRate, Eui, RoutingInformation, Window,
 };
 use lorawan::{Direction, PHYPayloadFrame, MHDR};
-use nlighten::gps::{WGS84Position, GPSTime};
+use nlighten::gps::{GPSTime, WGS84Position};
 use semtech_udp::{
     pull_resp::{self, PhyData},
     push_data::{self, CRC},
-    CodingRate, DataRate, Modulation, StringOrNum, MacAddress,
+    CodingRate, DataRate, MacAddress, Modulation, StringOrNum,
 };
 use sha2::{Digest, Sha256};
-use std::{convert::TryFrom, fmt::{self, Display}, str::FromStr};
+use std::{
+    convert::TryFrom,
+    fmt::{self, Display},
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -269,7 +273,11 @@ impl Packet {
             card_id: self.gateway.clone().into_array().to_vec(),
             pos: self.pos.map(convert_wgs84pos),
             time: self.gps_time.map(convert_gps_time),
-            signature: self.concentrator_sig.as_ref().ok_or_else(|| Error::custom("missing concentrator_sig"))?.to_vec(),
+            signature: self
+                .concentrator_sig
+                .as_ref()
+                .ok_or_else(|| Error::custom("missing concentrator_sig"))?
+                .to_vec(),
         })
     }
 
@@ -298,20 +306,27 @@ impl Packet {
                 )));
             }
         };
-        let report = poc_lora::LoraWitnessReportReqV1 {
-            pub_key: vec![],
-            data: payload,
-            tmst: self.timestamp as u32,
-            timestamp: SystemTime::now()
+
+        let timestamp = match self.gps_time {
+            Some(gps_time) => gps_time.to_utc().unix_timestamp_nanos() as u64,
+
+            None => SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(Error::from)?
                 .as_nanos() as u64,
+        };
+
+        let report = poc_lora::LoraWitnessReportReqV1 {
+            pub_key: vec![],
+            data: payload,
+            tmst: self.tmst,
+            timestamp: timestamp,
             signal: self.rssi.centi_dbm(),
             snr: self.snr.centi_db(),
             frequency: self.freq.hz().into(),
             datarate: dr as i32,
             signature: vec![],
-            secure_pkt: self.secure_packet().ok()
+            secure_pkt: self.secure_packet().ok(),
         };
         Ok(report)
     }
@@ -354,7 +369,6 @@ fn convert_gps_time(input: GPSTime) -> poc_lora::GpsTime {
 struct Frequency(u32);
 
 impl Frequency {
-
     fn from_mhz(mhz: f64) -> Self {
         Self((mhz * 1_000_000_f64).trunc() as u32)
     }
@@ -379,7 +393,6 @@ impl Display for Frequency {
 struct Snr(i32);
 
 impl Snr {
-
     fn from_db(db: f32) -> Self {
         Self((db * 10_f32).trunc() as i32)
     }
@@ -391,7 +404,6 @@ impl Snr {
     fn db(&self) -> f32 {
         self.0 as f32 / 10_f32
     }
-
 }
 
 impl Display for Snr {
@@ -405,7 +417,6 @@ impl Display for Snr {
 struct Rssi(i32);
 
 impl Rssi {
-
     fn from_dbm(dbm: i32) -> Self {
         Self(dbm)
     }
