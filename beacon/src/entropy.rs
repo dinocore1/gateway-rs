@@ -1,4 +1,6 @@
 use crate::{Error, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use helium_proto::EntropyReportV1;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -16,29 +18,33 @@ pub struct Entropy {
 }
 
 impl Entropy {
-    /// Construct entropy from a local system source. The timestamp for the
-    /// entropy is teh creation timestamp since a new one is created every time
-    /// this is called.
-    ///
-    /// Version 0 entropy uses 4 bytes of entropy from the operating system as
-    /// local entropy
+    /// Construct entropy from a local system source. The timestamp and version
+    /// of local entropy is always 0.
     pub fn local() -> Result<Self> {
         let mut local_entropy = vec![0u8; LOCAL_ENTROPY_SIZE];
         OsRng.fill_bytes(&mut local_entropy);
+        Ok(Self {
+            version: 0,
+            timestamp: 0,
+            data: local_entropy,
+        })
+    }
+
+    pub fn from_data(data: Vec<u8>) -> Result<Self> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(Error::from)?
             .as_secs() as i64;
         Ok(Self {
-            version: 0,
+            version: 1, // marked as local
             timestamp,
-            data: local_entropy,
+            data,
         })
     }
 
     pub(crate) fn digest<D: Digest>(&self, state: &mut D) {
         state.update(&self.data);
-        state.update(self.timestamp.to_ne_bytes());
+        state.update(self.timestamp.to_le_bytes());
     }
 }
 
@@ -47,12 +53,14 @@ fn default_version() -> u32 {
 }
 
 mod serde_base64 {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
     pub fn serialize<T, S>(key: &T, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         T: AsRef<[u8]>,
         S: serde::ser::Serializer,
     {
-        serializer.serialize_str(&base64::encode(key.as_ref()))
+        serializer.serialize_str(&STANDARD.encode(key.as_ref()))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
@@ -70,7 +78,9 @@ mod serde_base64 {
             where
                 E: serde::de::Error,
             {
-                base64::decode(value).map_err(|err| serde::de::Error::custom(err.to_string()))
+                STANDARD
+                    .decode(value)
+                    .map_err(|err| serde::de::Error::custom(err.to_string()))
             }
         }
 
@@ -80,7 +90,17 @@ mod serde_base64 {
 
 impl std::fmt::Display for Entropy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&base64::encode(&self.data))
+        f.write_str(&STANDARD.encode(&self.data))
+    }
+}
+
+impl From<EntropyReportV1> for Entropy {
+    fn from(value: EntropyReportV1) -> Self {
+        Self {
+            version: value.version,
+            timestamp: value.timestamp as i64,
+            data: value.data,
+        }
     }
 }
 

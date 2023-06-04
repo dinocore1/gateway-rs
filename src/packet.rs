@@ -1,64 +1,98 @@
-use crate::{error::DecodeError, Error, Result};
-use helium_proto::{
-    packet::PacketType, routing_information::Data as RoutingData, services::poc_lora,
-    BlockchainStateChannelResponseV1, DataRate as ProtoDataRate, Eui, RoutingInformation, Window,
+use crate::{error::DecodeError, Error, Region, Result};
+use chrono::{prelude::*};
+use helium_proto::services::{
+    poc_lora::{self, SecurePacketV1},
+    router::{PacketRouterPacketDownV1, PacketRouterPacketUpV1},
 };
 use lorawan::{Direction, PHYPayloadFrame, MHDR};
-use nlighten::gps::{GPSTime, WGS84Position};
 use semtech_udp::{
-    pull_resp::{self, PhyData},
+    pull_resp::{self, PhyData, Time},
     push_data::{self, CRC},
-    CodingRate, DataRate, MacAddress, Modulation, StringOrNum,
+    CodingRate, DataRate, Modulation, MacAddress, GPSTime, WGS84Position,
 };
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use std::{
     convert::TryFrom,
     fmt::{self, Display},
-    str::FromStr,
+    ops::Deref,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone)]
-pub struct Packet {
-    /// Internal timestamp of "RX finished" event (32b unsigned)
+pub struct PacketUp {
+    payload: Vec<u8>,
+
+    /// Internal timestamp of "RX finished" event (32b unsigned) as provided by SX130x
     tmst: u32,
 
-    datr: DataRate,
-
-    payload: Vec<u8>,
+    /// Timestamp of the received packet (nanoseconds since the unix epoch)
+    timestamp: u64,
 
     /// Received Signal Strength Indicator
     rssi: Rssi,
 
+    /// Frequency
+    freq: Frequency,
+
+    datr: DataRate,
+
     /// Signal to Noise radio
     snr: Snr,
 
-    /// Frequency
-    freq: Frequency,
+    region: Region,
+
+    hold_time: u64,
 
     /// Gateway
     gateway: MacAddress,
 
-    routing: Option<RoutingInformation>,
-
-    rx2_window: Option<Window>,
-
-    oui: u32,
-
-    packet_type: PacketType,
-
-    // Metadata from Secure Concentrator
+    // packet key. Used for Secure Concentrator
     key: Option<u32>,
+
     pos: Option<WGS84Position>,
-    gps_time: Option<GPSTime>,
+
     concentrator_sig: Option<Vec<u8>>,
 }
 
-impl fmt::Display for Packet {
+#[derive(Debug, Clone)]
+pub struct PacketDown(PacketRouterPacketDownV1);
+
+
+
+impl From<PacketUp> for PacketRouterPacketUpV1 {
+    fn from(value: PacketUp) -> Self {
+        PacketRouterPacketUpV1 {
+            timestamp: value.unix_timestamp(),
+            rssi: value.rssi.dbm(),
+            frequency: value.freq.hz(),
+            datarate: datarate::to_proto(value.datr) as i32,
+            snr: value.snr.db(),
+            region: value.region.into(),
+            hold_time: value.hold_time,
+            gateway: Vec::from(value.gateway.into_array()),
+            payload: value.payload,
+            signature: vec![],
+        }
+    }
+}
+impl From<&PacketUp> for PacketRouterPacketUpV1 {
+    fn from(value: &PacketUp) -> Self {
+        PacketRouterPacketUpV1::from(value.clone())
+    }
+}
+
+impl From<PacketRouterPacketDownV1> for PacketDown {
+    fn from(value: PacketRouterPacketDownV1) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for PacketUp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!(
             "@{} us, {}, {:?}, snr: {}, rssi: {}, len: {}",
-            self.tmst,
+            self.timestamp,
             self.freq,
             self.datr,
             self.snr,
@@ -68,105 +102,109 @@ impl fmt::Display for Packet {
     }
 }
 
-impl TryFrom<push_data::RxPk> for Packet {
+impl TryFrom<PacketUp> for poc_lora::LoraWitnessReportReqV1 {
     type Error = Error;
-
-    fn try_from(rxpk: push_data::RxPk) -> Result<Self> {
-        if rxpk.get_crc_status() == &CRC::OK {
-            let rssi = rxpk
-                .get_signal_rssi()
-                .unwrap_or_else(|| rxpk.get_channel_rssi());
-
-            let (key, pos, gps_time) = match rxpk {
-                push_data::RxPk::V3(ref p) => (Some(p.key), p.pos, p.gps_time),
-                _ => (None, None, None),
+    fn try_from(value: PacketUp) -> Result<Self> {
+        let payload = match PacketUp::parse_frame(Direction::Uplink, value.payload()) {
+            Ok(PHYPayloadFrame::Proprietary(payload)) => payload,
+            _ => return Err(DecodeError::not_beacon()),
+        };
+        let secure_pkt = if value.is_secure_packet() {
+            let time = std::time::Duration::from_nanos(value.timestamp);
+            let time = helium_proto::GpsTime {
+                sec: time.as_secs(),
+                nano: time.subsec_nanos(),
             };
-
-            let packet = Self {
-                packet_type: PacketType::Lorawan.into(),
-                tmst: *rxpk.get_timestamp(),
-                datr: rxpk.get_datarate(),
-                rssi: Rssi::from_dbm(rssi),
-                snr: Snr::from_db(rxpk.get_snr()),
-                freq: Frequency::from_mhz(rxpk.get_frequency()),
-                gateway: MacAddress::nil(),
-                routing: Self::routing_information(&Self::parse_frame(
-                    lorawan::Direction::Uplink,
-                    rxpk.get_data(),
-                )?)?,
-                payload: rxpk.get_data().to_vec(),
-                rx2_window: None,
-                oui: 0,
-                key: key,
-                pos: pos,
-                gps_time: gps_time,
-                concentrator_sig: None,
-            };
-            Ok(packet)
+            
+            Some(SecurePacketV1 {
+                card_id: Vec::from(value.gateway.into_array()),
+                pos: value.get_pos(),
+                time: Some(time),
+                sc_signature: value.concentrator_sig.unwrap_or_else(|| vec![]),
+            })
         } else {
-            Err(DecodeError::invalid_crc())
-        }
+            None
+        };
+        let report = poc_lora::LoraWitnessReportReqV1 {
+            data: payload,
+            tmst: value.tmst,
+            timestamp: value.timestamp,
+            signal: value.rssi.centi_dbm(),
+            snr: value.snr.centi_db(),
+            frequency: value.freq.hz() as u64,
+            datarate: datarate::to_proto(value.datr) as i32,
+            pub_key: vec![],
+            signature: vec![],
+            secure_pkt,
+        };
+        Ok(report)
     }
 }
 
-impl From<helium_proto::Packet> for Packet {
-    fn from(v: helium_proto::Packet) -> Self {
-        Self {
-            tmst: v.timestamp as u32,
-            datr: DataRate::from_str(&v.datarate).unwrap(),
-            payload: v.payload.to_vec(),
-            rssi: Rssi::from_dbm(v.signal_strength as i32),
-            snr: Snr::from_db(v.snr),
-            freq: Frequency::from_mhz(v.frequency.into()),
+impl PacketUp {
+    pub fn from_rxpk(rxpk: push_data::RxPk, region: Region) -> Result<Self> {
+        if rxpk.get_crc_status() != &CRC::OK {
+            return Err(DecodeError::invalid_crc());
+        }
+        let rssi = rxpk
+            .get_signal_rssi()
+            .unwrap_or_else(|| rxpk.get_channel_rssi());
+
+        fn now_timestamp() -> u64 {
+            SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(Error::from).unwrap()
+            .as_nanos() as u64
+        }
+
+        // Get the timestamp (nanoseconds since the unix epoch) of the packet arrival time
+        // Use the GPS time if provided as first priority as that will be the most accurate.
+        // use the time as provided from the packet forwarder next.
+        // as a last resort use the current system time.
+        let timestamp = match (rxpk.get_gpstime(), rxpk.get_time()) {
+            (Some(gps_time), _) => gps_time.to_datetime().unix_timestamp_nanos() as u64,
+            (None, Some(time_str)) => match DateTime::parse_from_rfc3339(time_str.as_ref()) {
+                Ok(time) => time.timestamp_nanos() as u64,
+                Err(parse_error) => {
+                    warn!("unable to parse time: {}: {}", time_str, parse_error);
+                    now_timestamp()
+                }
+            }
+            (None, None) => now_timestamp(),
+        };
+
+        let packet = Self {
+            payload: rxpk.get_data().to_vec(),
+            tmst: *rxpk.get_timestamp(),
+            timestamp,
+            rssi: Rssi::from_dbm(rssi),
+            freq: Frequency::from_mhz(rxpk.get_frequency()),
+            datr: rxpk.get_datarate(),
+            snr: Snr::from_db(rxpk.get_snr()),
+            region: region.into(),
+            hold_time: 0,
             gateway: MacAddress::nil(),
-            oui: v.oui,
-            packet_type: v.r#type(),
-            rx2_window: v.rx2_window,
-            routing: v.routing,
-            key: None,
-            pos: None,
-            gps_time: None,
+            key: rxpk.get_id(),
+            pos: rxpk.get_pos(),
             concentrator_sig: None,
-        }
-    }
-}
+        };
 
-impl Packet {
-    pub fn routing(&self) -> &Option<RoutingInformation> {
-        &self.routing
+        Ok(packet)
     }
 
-    pub fn to_packet(self) -> helium_proto::Packet {
-        helium_proto::Packet {
-            oui: self.oui,
-            r#type: self.packet_type.into(),
-            payload: self.payload.to_vec(),
-            timestamp: self.tmst.into(),
-            signal_strength: self.rssi.dbm() as f32,
-            frequency: self.freq.to_mhz(),
-            datarate: self.datr.to_string(),
-            snr: self.snr.db(),
-            routing: self.routing,
-            rx2_window: self.rx2_window,
-        }
+    pub fn is_potential_beacon(&self) -> bool {
+        Self::parse_header(self.payload())
+            .map(|header| header.mtype() == lorawan::MType::Proprietary)
+            .unwrap_or(false)
     }
 
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 
-    pub fn routing_information(frame: &PHYPayloadFrame) -> Result<Option<RoutingInformation>> {
-        let routing_data = match frame {
-            PHYPayloadFrame::JoinRequest(request) => Some(RoutingData::Eui(Eui {
-                deveui: request.dev_eui,
-                appeui: request.app_eui,
-            })),
-            PHYPayloadFrame::MACPayload(mac_payload) => {
-                Some(RoutingData::Devaddr(mac_payload.dev_addr()))
-            }
-            _ => return Ok(None),
-        };
-        Ok(routing_data.map(|r| RoutingInformation { data: Some(r) }))
+    pub fn parse_header(payload: &[u8]) -> Result<MHDR> {
+        use std::io::Cursor;
+        lorawan::MHDR::read(&mut Cursor::new(payload)).map_err(Error::from)
     }
 
     pub fn parse_frame(direction: lorawan::Direction, payload: &[u8]) -> Result<PHYPayloadFrame> {
@@ -176,162 +214,16 @@ impl Packet {
             .map_err(Error::from)
     }
 
-    pub fn parse_header(payload: &[u8]) -> Result<MHDR> {
-        use std::io::Cursor;
-        lorawan::MHDR::read(&mut Cursor::new(payload)).map_err(Error::from)
-    }
-
-    pub fn is_potential_beacon(&self) -> bool {
-        Self::parse_header(self.payload())
-            .map(|header| header.mtype() == lorawan::MType::Proprietary)
-            .unwrap_or(false)
-    }
-
-    pub fn to_pull_resp(&self, use_rx2: bool, tx_power: u32) -> Result<Option<pull_resp::TxPk>> {
-        let (timestamp, frequency, datarate) = if use_rx2 {
-            if let Some(rx2) = &self.rx2_window {
-                (Some(rx2.timestamp), rx2.frequency, rx2.datarate.parse()?)
-            } else {
-                return Ok(None);
-            }
-        } else {
-            (
-                Some(self.tmst as u64),
-                self.freq.to_mhz(),
-                self.datr.clone(),
-            )
-        };
-        Ok(Some(pull_resp::TxPk {
-            imme: timestamp.is_none(),
-            ipol: true,
-            modu: Modulation::LORA,
-            codr: CodingRate::_4_5,
-            datr: datarate,
-            // for normal lorawan packets we're not selecting different frequencies
-            // like we are for PoC
-            freq: frequency as f64,
-            data: PhyData::new(self.payload.clone()),
-            powe: tx_power as u64,
-            rfch: 0,
-            tmst: match timestamp {
-                Some(t) => Some(StringOrNum::N(t as u32)),
-                None => Some(StringOrNum::S("immediate".to_string())),
-            },
-            tmms: None,
-            fdev: None,
-            prea: None,
-            ncrc: None,
-        }))
-    }
-
-    pub fn from_state_channel_response(response: BlockchainStateChannelResponseV1) -> Option<Self> {
-        response.downlink.map(Self::from)
-    }
-
     pub fn hash(&self) -> Vec<u8> {
         Sha256::digest(&self.payload).to_vec()
     }
 
-    pub fn dc_payload(&self) -> u64 {
-        const DC_PAYLOAD_SIZE: usize = 24;
-        let payload_size = self.payload().len();
-        if payload_size <= DC_PAYLOAD_SIZE {
-            1
-        } else {
-            // integer div/ceil from: https://stackoverflow.com/a/2745086
-            ((payload_size + DC_PAYLOAD_SIZE - 1) / DC_PAYLOAD_SIZE) as u64
-        }
+    pub fn is_secure_packet(&self) -> bool {
+        // Packets from Secure Concentrators always have the packet id key (because the key is used to match the packet signature)
+        self.key.is_some()
     }
 
-    pub fn secure_packet(&self) -> Result<poc_lora::SecurePacketV1> {
-        let dr = match ProtoDataRate::from_str(&self.datr.to_string()) {
-            Ok(value)
-                if [
-                    ProtoDataRate::Sf7bw125,
-                    ProtoDataRate::Sf8bw125,
-                    ProtoDataRate::Sf9bw125,
-                    ProtoDataRate::Sf10bw125,
-                    ProtoDataRate::Sf12bw125,
-                ]
-                .contains(&value) =>
-            {
-                value
-            }
-            _ => {
-                return Err(Error::custom(format!(
-                    "invalid beacon witness datarate: {}",
-                    self.datr.to_string()
-                )));
-            }
-        };
-        Ok(poc_lora::SecurePacketV1 {
-            freq: self.freq.hz().into(),
-            datarate: dr as i32,
-            snr: self.snr.centi_db(),
-            rssi: self.rssi.dbm(),
-            tmst: self.tmst,
-            card_id: self.gateway.clone().into_array().to_vec(),
-            pos: self.pos.map(convert_wgs84pos),
-            time: self.gps_time.map(convert_gps_time),
-            signature: self
-                .concentrator_sig
-                .as_ref()
-                .ok_or_else(|| Error::custom("missing concentrator_sig"))?
-                .to_vec(),
-        })
-    }
-
-    pub fn to_witness_report(self) -> Result<poc_lora::LoraWitnessReportReqV1> {
-        let payload = match Self::parse_frame(Direction::Uplink, self.payload()) {
-            Ok(PHYPayloadFrame::Proprietary(payload)) => payload,
-            _ => return Err(Error::custom("not a beacon")),
-        };
-        let dr = match ProtoDataRate::from_str(&self.datr.to_string()) {
-            Ok(value)
-                if [
-                    ProtoDataRate::Sf7bw125,
-                    ProtoDataRate::Sf8bw125,
-                    ProtoDataRate::Sf9bw125,
-                    ProtoDataRate::Sf10bw125,
-                    ProtoDataRate::Sf12bw125,
-                ]
-                .contains(&value) =>
-            {
-                value
-            }
-            _ => {
-                return Err(Error::custom(format!(
-                    "invalid beacon witness datarate: {}",
-                    self.datr.to_string()
-                )));
-            }
-        };
-
-        let timestamp = match self.gps_time {
-            Some(gps_time) => gps_time.to_utc().unix_timestamp_nanos() as u64,
-
-            None => SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(Error::from)?
-                .as_nanos() as u64,
-        };
-
-        let report = poc_lora::LoraWitnessReportReqV1 {
-            pub_key: vec![],
-            data: payload,
-            tmst: self.tmst,
-            timestamp: timestamp,
-            signal: self.rssi.centi_dbm(),
-            snr: self.snr.centi_db(),
-            frequency: self.freq.hz().into(),
-            datarate: dr as i32,
-            signature: vec![],
-            secure_pkt: self.secure_packet().ok(),
-        };
-        Ok(report)
-    }
-
-    pub fn packet_key(&self) -> Option<u32> {
+    pub fn packet_id(&self) -> Option<u32> {
         self.key
     }
 
@@ -339,15 +231,149 @@ impl Packet {
         self.concentrator_sig = Some(sig);
     }
 
-    /// did this packet come from a Secure Concentrator?
-    pub fn is_secure_packet(&self) -> bool {
-        // Secure Packets always have the populated key
-        self.key.is_some()
+    /// get the unix timestamp (in nanoseconds) of the packet arrival time
+    pub fn unix_timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    pub fn get_pos(&self) -> Option<helium_proto::Wgs84Position> {
+        match self.pos {
+            Some(pos) => Some(convert_wgs84pos(pos)),
+            None => None,
+        }
     }
 }
 
-fn convert_wgs84pos(input: WGS84Position) -> poc_lora::Wgs84Position {
-    poc_lora::Wgs84Position {
+impl PacketDown {
+    pub fn to_rx1_pull_resp(&self, tx_power: u32) -> Result<pull_resp::TxPk> {
+        let rx1 = self.0.rx1.as_ref().ok_or_else(DecodeError::no_rx1_window)?;
+        let time = if rx1.immediate {
+            Time::immediate()
+        } else {
+            Time::by_tmst(rx1.timestamp as u32)
+        };
+        self.inner_to_pull_resp(
+            time,
+            rx1.frequency,
+            datarate::from_proto(rx1.datarate())?,
+            tx_power,
+        )
+    }
+
+    pub fn to_rx2_pull_resp(&self, tx_power: u32) -> Result<Option<pull_resp::TxPk>> {
+        let rx2 = match self.0.rx2.as_ref() {
+            Some(window) => window,
+            None => return Ok(None),
+        };
+
+        self.inner_to_pull_resp(
+            Time::by_tmst(rx2.timestamp as u32),
+            rx2.frequency,
+            datarate::from_proto(rx2.datarate())?,
+            tx_power,
+        )
+        .map(Some)
+    }
+
+    fn inner_to_pull_resp(
+        &self,
+        time: Time,
+        frequency_hz: u32,
+        datarate: DataRate,
+        tx_power: u32,
+    ) -> Result<pull_resp::TxPk> {
+        Ok(pull_resp::TxPk {
+            time,
+            ipol: true,
+            modu: Modulation::LORA,
+            codr: CodingRate::_4_5,
+            datr: datarate,
+            // for normal lorawan packets we're not selecting different frequencies
+            // like we are for PoC
+            freq: to_mhz(frequency_hz),
+            data: PhyData::new(self.0.payload.clone()),
+            powe: tx_power as u64,
+            rfch: 0,
+            fdev: None,
+            prea: None,
+            ncrc: None,
+        })
+    }
+}
+
+pub(crate) fn to_mhz<H: Into<f64>>(hz: H) -> f64 {
+    hz.into() / 1_000_000.0
+}
+
+pub(crate) mod datarate {
+    use super::{DecodeError, Result};
+    use helium_proto::DataRate as ProtoRate;
+    use semtech_udp::{Bandwidth, DataRate, SpreadingFactor};
+
+    pub fn from_proto(rate: ProtoRate) -> Result<DataRate> {
+        let (spreading_factor, bandwidth) = match rate {
+            ProtoRate::Sf12bw125 => (SpreadingFactor::SF12, Bandwidth::BW125),
+            ProtoRate::Sf11bw125 => (SpreadingFactor::SF11, Bandwidth::BW125),
+            ProtoRate::Sf10bw125 => (SpreadingFactor::SF10, Bandwidth::BW125),
+            ProtoRate::Sf9bw125 => (SpreadingFactor::SF9, Bandwidth::BW125),
+            ProtoRate::Sf8bw125 => (SpreadingFactor::SF8, Bandwidth::BW125),
+            ProtoRate::Sf7bw125 => (SpreadingFactor::SF7, Bandwidth::BW125),
+
+            ProtoRate::Sf12bw250 => (SpreadingFactor::SF12, Bandwidth::BW250),
+            ProtoRate::Sf11bw250 => (SpreadingFactor::SF11, Bandwidth::BW250),
+            ProtoRate::Sf10bw250 => (SpreadingFactor::SF10, Bandwidth::BW250),
+            ProtoRate::Sf9bw250 => (SpreadingFactor::SF9, Bandwidth::BW250),
+            ProtoRate::Sf8bw250 => (SpreadingFactor::SF8, Bandwidth::BW250),
+            ProtoRate::Sf7bw250 => (SpreadingFactor::SF7, Bandwidth::BW250),
+
+            ProtoRate::Sf12bw500 => (SpreadingFactor::SF12, Bandwidth::BW500),
+            ProtoRate::Sf11bw500 => (SpreadingFactor::SF11, Bandwidth::BW500),
+            ProtoRate::Sf10bw500 => (SpreadingFactor::SF10, Bandwidth::BW500),
+            ProtoRate::Sf9bw500 => (SpreadingFactor::SF9, Bandwidth::BW500),
+            ProtoRate::Sf8bw500 => (SpreadingFactor::SF8, Bandwidth::BW500),
+            ProtoRate::Sf7bw500 => (SpreadingFactor::SF7, Bandwidth::BW500),
+
+            ProtoRate::Lrfhss2bw137
+            | ProtoRate::Lrfhss1bw336
+            | ProtoRate::Lrfhss1bw137
+            | ProtoRate::Lrfhss2bw336
+            | ProtoRate::Lrfhss1bw1523
+            | ProtoRate::Lrfhss2bw1523
+            | ProtoRate::Fsk50 => {
+                return Err(DecodeError::invalid_data_rate("unsupported".to_string()))
+            }
+        };
+        Ok(DataRate::new(spreading_factor, bandwidth))
+    }
+
+    pub fn to_proto(rate: DataRate) -> ProtoRate {
+        match (rate.spreading_factor(), rate.bandwidth()) {
+            (SpreadingFactor::SF12, Bandwidth::BW125) => ProtoRate::Sf12bw125,
+            (SpreadingFactor::SF11, Bandwidth::BW125) => ProtoRate::Sf11bw125,
+            (SpreadingFactor::SF10, Bandwidth::BW125) => ProtoRate::Sf10bw125,
+            (SpreadingFactor::SF9, Bandwidth::BW125) => ProtoRate::Sf9bw125,
+            (SpreadingFactor::SF8, Bandwidth::BW125) => ProtoRate::Sf8bw125,
+            (SpreadingFactor::SF7, Bandwidth::BW125) => ProtoRate::Sf7bw125,
+
+            (SpreadingFactor::SF12, Bandwidth::BW250) => ProtoRate::Sf12bw250,
+            (SpreadingFactor::SF11, Bandwidth::BW250) => ProtoRate::Sf11bw250,
+            (SpreadingFactor::SF10, Bandwidth::BW250) => ProtoRate::Sf10bw250,
+            (SpreadingFactor::SF9, Bandwidth::BW250) => ProtoRate::Sf9bw250,
+            (SpreadingFactor::SF8, Bandwidth::BW250) => ProtoRate::Sf8bw250,
+            (SpreadingFactor::SF7, Bandwidth::BW250) => ProtoRate::Sf7bw250,
+
+            (SpreadingFactor::SF12, Bandwidth::BW500) => ProtoRate::Sf12bw500,
+            (SpreadingFactor::SF11, Bandwidth::BW500) => ProtoRate::Sf11bw500,
+            (SpreadingFactor::SF10, Bandwidth::BW500) => ProtoRate::Sf10bw500,
+            (SpreadingFactor::SF9, Bandwidth::BW500) => ProtoRate::Sf9bw500,
+            (SpreadingFactor::SF8, Bandwidth::BW500) => ProtoRate::Sf8bw500,
+            (SpreadingFactor::SF7, Bandwidth::BW500) => ProtoRate::Sf7bw500,
+        }
+    }
+}
+
+fn convert_wgs84pos(input: WGS84Position) -> helium_proto::Wgs84Position {
+    helium_proto::Wgs84Position {
         latitude: input.lat,
         longitude: input.lon,
         height: input.height,
@@ -356,9 +382,9 @@ fn convert_wgs84pos(input: WGS84Position) -> poc_lora::Wgs84Position {
     }
 }
 
-fn convert_gps_time(input: GPSTime) -> poc_lora::GpsTime {
+fn convert_gps_time(input: GPSTime) -> helium_proto::GpsTime {
     let duration = input.as_duration();
-    poc_lora::GpsTime {
+    helium_proto::GpsTime {
         sec: duration.as_secs(),
         nano: duration.subsec_nanos(),
     }

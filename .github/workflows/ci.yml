@@ -1,82 +1,87 @@
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
     tags: ["v*"]
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTFLAGS: "-D warnings"
+  RUSTUP_MAX_RETRIES: 10
+
 name: ci
 
 jobs:
-  build:
-    name: hygiene
+  hygiene:
     runs-on: ubuntu-22.04
+
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Install dependencies
-        run: sudo apt-get install -y libtss2-dev
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          default: true
-          override: true
-          components: clippy, rustfmt
-
-      - name: Cancel previous runs
-        uses: styfle/cancel-workflow-action@0.5.0
+      - name: Setup | Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
         with:
           access_token: ${{ github.token }}
 
-      - name: Run tests
-        run: cargo test
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
 
-      - name: Check formatting
-        run: cargo fmt  -- --check
-
-      - name: Clippy
-        uses: actions-rs/clippy-check@v1
+      - name: Setup | Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features -- -Dclippy::all
+          components: clippy, rustfmt
 
-  package:
-    name: package
+      - name: Setup | Tools
+        run: sudo apt-get install -y protobuf-compiler libtss2-dev
+
+      - name: Setup | Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build | Hygiene
+        run: |
+          cargo fmt  -- --check
+          cargo clippy --all-features -- -D clippy::all
+
+      - name: Build | Test
+        run: |
+          cargo test
+
+  build:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         target:
-          - klkgw
-          - ramips_24kec
-          - smartharvest
-          - dragino
-          - mtcdt
-          - raspi01
-          - raspi234
-          - resiot
-          - x86_64
-          - freedomfi
-          - cotx
-          - raspi_64
-          - cloudgate
-          - caldigit
-          - tektelic
-          - risinghf
-          - clodpi
+          - arm-unknown-linux-gnueabihf
+          - armv5te-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-musl
+          - mips-unknown-linux-musl
+          - mipsel-unknown-linux-musl
+          - x86_64-unknown-debian-gnu
+          - x86_64-tpm-debian-gnu
+
     steps:
-      - uses: actions-rs/toolchain@v1
+      - name: Setup | Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
         with:
-          toolchain: nightly
-          override: true
-      - uses: davidB/rust-cargo-make@v1
-      - uses: actions/checkout@v2
+          access_token: ${{ github.token }}
 
-      - name: Install dependencies
-        run: sudo apt-get install -y libtss2-dev llvm-dev libclang-dev clang
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
 
-      - name: install cross
-        uses: jaxxstorm/action-install-gh-release@release/v1-alpha
+      - name: Setup | Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup | Tools
+        uses: davidB/rust-cargo-make@v1
+
+      - name: Setup | Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Setup | Cross
+        uses: jaxxstorm/action-install-gh-release@v1.9.0
         env:
           ## Allow cross install into PATH
           ACTIONS_ALLOW_UNSECURE_COMMANDS: true
@@ -84,26 +89,109 @@ jobs:
         with:
           repo: rust-embedded/cross
 
-      - name: install cargo-deb
-        uses: actions-rs/cargo@v1
+      - name: Build | Compile
+        run: cargo make --profile ${{ matrix.target }} build
+
+      - name: Buld | Package
+        run: cargo make --profile ${{ matrix.target }} pkg
+
+      - name: Build | Artifacts
+        uses: actions/upload-artifact@v3
         with:
-          command: install
-          args: cargo-deb
+          name: helium-gateway-${{ matrix.target }}
+          if-no-files-found: error
+          path: helium-gateway-*.tar.gz
 
-      - name: build package
-        run: RUST_BACKTRACE=1 LIBCLANG_PATH="/usr/lib/llvm-14/lib/" cargo make --profile ${{ matrix.target }} pkg
+  release:
+    if: startsWith(github.ref, 'refs/tags')
+    needs: [hygiene, build]
+    runs-on: ubuntu-22.04
 
-      - name: name release
-        if: startsWith(github.ref, 'refs/tags')
-        id: vars
-        run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
+    steps:
+      - name: Setup | Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
+        with:
+          access_token: ${{ github.token }}
 
-      - name: create release
+      - name: Setup | Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: helium-gateway-*.tar.gz
+
+      - name: Release | Artifacts
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          name: Release ${{ steps.vars.outputs.tag }}
-          files: target/pkg/helium-gateway-${{ steps.vars.outputs.tag }}-${{ matrix.target }}.*
+          fail_on_unmatched_files: true
+          files: |
+            **/helium-gateway-*.tar.gz
+          name: ${{github.ref_name}}
+
+  docker_buildx:
+    # Ensure we don't publish images until we pass clippy.
+    needs: [hygiene]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Setup | Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.11.0
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup | Docker
+        uses: docker/setup-buildx-action@v2
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Setup | Quay.io
+        uses: docker/login-action@v2
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_MINER_USER }}
+          password: ${{ secrets.QUAY_MINER_UPLOAD_TOKEN }}
+
+      - name: Setup | Image Tag
+        if: github.event_name == 'pull_request'
+        run: echo "image_tag=PR${{ github.event.pull_request.number }}-$(git rev-parse --short ${{ github.event.pull_request.head.sha }})" >> $GITHUB_ENV
+
+      - name: Setup | Image Tag
+        if: github.event_name != 'pull_request'
+        run: echo "image_tag=$(git describe)" >> $GITHUB_ENV
+
+      # We publish all builds to the test-images repo.
+      - name: Build | Test Image
+        uses: docker/build-push-action@v3
+        env:
+          # The attestation manifests cause build errors for some makers.
+          # See https://github.com/helium/gateway-rs/issues/409
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+        with:
+          push: true
+          platforms: linux/amd64,linux/arm64
+          labels: VERSION=${{ env.image_tag }}
+          tags: quay.io/team-helium/test-images:gateway-${{ env.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Publish to miner quay-repo on release only.
+      - name: Build | Release Image
+        if: startsWith(github.ref, 'refs/tags')
+        uses: docker/build-push-action@v3
+        env:
+          # The attestation manifests cause build errors for some makers.
+          # See https://github.com/helium/gateway-rs/issues/409
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+        with:
+          push: true
+          platforms: linux/amd64,linux/arm64
+          labels: VERSION=${{ github.ref_name }}
+          tags: |
+            quay.io/team-helium/miner:gateway-${{ github.ref_name }}
+            quay.io/team-helium/miner:gateway-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,9 +1,13 @@
-use super::{
-    connect_uri, AddGatewayReq, ConfigReq, ConfigValue, GatewayStakingMode, HeightReq, HeightRes,
-    PubkeyReq, RegionReq, SignReq,
+use super::{AddGatewayReq, GatewayStakingMode, PubkeyReq, RegionReq, RouterReq};
+use crate::{
+    error::{DecodeError, Error},
+    packet_router::RouterStatus,
+    settings::{ListenAddress, StakingMode},
+    PublicKey, Region, Result,
 };
-use crate::{error::Error, settings::StakingMode, PublicKey, Region, Result, TxnEnvelope};
-use helium_proto::{services::local::Client, BlockchainTxnAddGatewayV1};
+use helium_proto::{
+    services::local::Client, BlockchainTxn, BlockchainTxnAddGatewayV1, Message, Txn,
+};
 use std::convert::TryFrom;
 use tonic::transport::{Channel, Endpoint};
 
@@ -12,9 +16,9 @@ pub struct LocalClient {
 }
 
 impl LocalClient {
-    pub async fn new(port: u16) -> Result<Self> {
-        let uri = connect_uri(port);
-        let endpoint = Endpoint::from_shared(uri).unwrap();
+    pub async fn new(address: &ListenAddress) -> Result<Self> {
+        let uri = http::Uri::try_from(address)?;
+        let endpoint = Endpoint::from_shared(uri.to_string()).unwrap();
         let client = Client::connect(endpoint)
             .await
             .map_err(Error::local_client_connect)?;
@@ -29,29 +33,14 @@ impl LocalClient {
         Ok((public_key, onboarding_key))
     }
 
-    pub async fn sign(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let response = self.client.sign(SignReq { data: data.into() }).await?;
-        let signature = response.into_inner().signature;
-        Ok(signature)
-    }
-
-    pub async fn config<T>(&mut self, keys: &[T]) -> Result<Vec<ConfigValue>>
-    where
-        T: ToString,
-    {
-        let keys = keys.iter().map(|s| s.to_string()).collect();
-        let response = self.client.config(ConfigReq { keys }).await?.into_inner();
-        Ok(response.values)
-    }
-
-    pub async fn height(&mut self) -> Result<HeightRes> {
-        let response = self.client.height(HeightReq {}).await?.into_inner();
-        Ok(response)
-    }
-
     pub async fn region(&mut self) -> Result<Region> {
         let response = self.client.region(RegionReq {}).await?;
-        Region::from_i32(response.into_inner().region)
+        Ok(Region::from_i32(response.into_inner().region)?)
+    }
+
+    pub async fn router(&mut self) -> Result<RouterStatus> {
+        let response = self.client.router(RouterReq {}).await?;
+        response.into_inner().try_into()
     }
 
     pub async fn add_gateway(
@@ -68,8 +57,12 @@ impl LocalClient {
                 staking_mode: GatewayStakingMode::from(mode).into(),
             })
             .await?;
+
         let encoded = response.into_inner().add_gateway_txn;
-        let txn = BlockchainTxnAddGatewayV1::from_envelope_vec(&encoded)?;
-        Ok(txn)
+        let envelope = BlockchainTxn::decode(encoded.as_ref())?;
+        match envelope.txn {
+            Some(Txn::AddGateway(txn)) => Ok(txn),
+            _ => Err(DecodeError::invalid_envelope()),
+        }
     }
 }

@@ -1,64 +1,51 @@
 //! This module provides proof-of-coverage (PoC) beaconing support.
-//!
-//! TODO: where to get beacon interval from?
-//!
-//! TODO: fuzz beacon interval to prevent thundering herd.
 
 use crate::{
     gateway::{self, BeaconResp},
-    service::{entropy::EntropyService, poc::PocLoraService},
+    region_watcher,
+    service::{entropy::EntropyService, poc::PocIotService},
     settings::Settings,
-    sync, Base64, Error, Keypair, MsgSign, Packet, RegionParams, Result,
+    sign, sync, Base64, Keypair, PacketUp, RegionParams, Result,
 };
 use futures::TryFutureExt;
-use helium_proto::services::poc_lora;
+use helium_proto::{services::poc_lora, Message as ProtoMessage};
 use http::Uri;
-use slog::{self, info, warn, Logger};
-use std::{sync::Arc, time::Duration, collections::VecDeque};
-use tokio::time;
-use triggered::Listener;
+use rand::{rngs::OsRng, Rng};
+use std::{{sync::Arc}, collections::VecDeque};
+use tokio::time::{self, Duration, Instant};
+use tracing::{info, warn};
+use xxhash_rust::xxh64::xxh64;
+
+/// To prevent a thundering herd of hotspots all beaconing at the same time, we
+/// add a randomized jitter value of up to `BEACON_INTERVAL_JITTER_PERCENTAGE`
+/// to the configured beacon interval. This jitter factor is one time only, and
+/// will only change when this process or task restarts.
+const BEACON_INTERVAL_JITTER_PERCENTAGE: u64 = 10;
 
 /// Message types that can be sent to `Beaconer`'s inbox.
 #[derive(Debug)]
 pub enum Message {
-    ReceivedBeacon(Packet),
-    ReceivedPacketSig(semtech_udp::push_data_sig::Packet),
-    RegionParamsChanged(RegionParams),
+    ReceivedBeacon(PacketUp),
+    ReceivedPacketSig(semtech_udp::push_data_sig::Packet)
 }
 
 pub type MessageSender = sync::MessageSender<Message>;
 pub type MessageReceiver = sync::MessageReceiver<Message>;
 
-pub fn message_channel(size: usize) -> (MessageSender, MessageReceiver) {
-    sync::message_channel(size)
+pub fn message_channel() -> (MessageSender, MessageReceiver) {
+    sync::message_channel(10)
 }
 
 impl MessageSender {
-    pub async fn received_beacon(&self, packet: Packet) {
-        let _ = self
-            .0
-            .send(Message::ReceivedBeacon(packet))
-            .map_err(|_| Error::channel())
-            .await;
+    pub async fn received_beacon(&self, packet: PacketUp) {
+        self.send(Message::ReceivedBeacon(packet)).await
     }
 
     pub async fn received_packet_sig(&self, packet: semtech_udp::push_data_sig::Packet) {
-        let _ = self
-            .0
-            .send(Message::ReceivedPacketSig(packet))
-            .map_err(|_| Error::channel())
-            .await;
-    }
-
-    pub async fn region_params_changed(&self, region_params: RegionParams) {
-        let _ = self
-            .0
-            .send(Message::RegionParamsChanged(region_params))
-            .await;
+        self.send(Message::ReceivedPacketSig(packet)).await
     }
 }
 
-#[derive(Debug)]
 pub struct Beaconer {
     /// keypair to sign reports with
     keypair: Arc<Keypair>,
@@ -66,190 +53,296 @@ pub struct Beaconer {
     transmit: gateway::MessageSender,
     /// Our receive queue.
     messages: MessageReceiver,
+    /// Region change queue
+    region_watch: region_watcher::MessageReceiver,
     /// Beacon interval
     interval: Duration,
+    // Time next beacon attempt is o be made
+    next_beacon_time: Instant,
+    /// The last beacon that was transitted
+    last_beacon: Option<beacon::Beacon>,
     /// Use for channel plan and FR parameters
-    region_params: Option<RegionParams>,
+    region_params: RegionParams,
     poc_ingest_uri: Uri,
-    entropy_service: EntropyService,
-    secure_packets: VecDeque<Packet>,
+    entropy_uri: Uri,
+    secure_packets: VecDeque<PacketUp>,
 }
 
 impl Beaconer {
     pub fn new(
         settings: &Settings,
-        transmit: gateway::MessageSender,
         messages: MessageReceiver,
+        region_watch: region_watcher::MessageReceiver,
+        transmit: gateway::MessageSender,
     ) -> Self {
         let interval = Duration::from_secs(settings.poc.interval);
         let poc_ingest_uri = settings.poc.ingest_uri.clone();
-        let entropy_service = EntropyService::new(settings.poc.entropy_uri.clone());
+        let entropy_uri = settings.poc.entropy_uri.clone();
         let keypair = settings.keypair.clone();
+        let region_params = region_watcher::current_value(&region_watch);
 
         Self {
             keypair,
             transmit,
             messages,
+            region_watch,
             interval,
-            region_params: None,
+            last_beacon: None,
+            // Set a beacon at least an interval out... arrival of region_params
+            // will recalculate this time and no arrival of region_params will
+            // cause the beacon to not occur
+            next_beacon_time: Instant::now() + interval,
+            region_params,
             poc_ingest_uri,
-            entropy_service,
+            entropy_uri,
             secure_packets: VecDeque::with_capacity(10),
         }
     }
 
+    pub async fn run(&mut self, shutdown: &triggered::Listener) -> Result {
+        info!(beacon_interval = self.interval.as_secs(), "starting");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.clone() => {
+                    info!("shutting down");
+                    return Ok(())
+                },
+                _ = time::sleep_until(self.next_beacon_time) => {
+                    self.handle_beacon_tick().await
+                },
+                message = self.messages.recv() => match message {
+                    Some(message) => self.handle_message(message).await,
+                    None => {
+                        warn!("ignoring closed message channel");
+                    }
+                },
+                region_change = self.region_watch.changed() => match region_change {
+                    Ok(()) => {
+                        // Recalculate beacon time based on if this was the
+                        // first time region params have arrived. Do the first
+                        // time check below before region params are assigned
+                        self.next_beacon_time =
+                            Self::mk_next_beacon_time(self.interval, self.region_params.params.is_empty());
+                        self.region_params = region_watcher::current_value(&self.region_watch);
+                        info!(region = RegionParams::to_string(&self.region_params), "region updated");
+                    },
+                    Err(_) => warn!("region watch disconnected"),
+                }
+
+
+            }
+        }
+    }
+
     pub async fn mk_beacon(&mut self) -> Result<beacon::Beacon> {
-        let remote_entropy = self.entropy_service.get_entropy().await?;
+        self.region_params.check_valid()?;
+
+        let mut entropy_service = EntropyService::new(self.entropy_uri.clone());
+        let remote_entropy = entropy_service.get_entropy().await?;
         let local_entropy = beacon::Entropy::local()?;
 
-        let region_params = if let Some(region_params) = &self.region_params {
-            region_params
-        } else {
-            return Err(Error::custom("no region set"));
-        };
-        let beacon = beacon::Beacon::new(remote_entropy, local_entropy, region_params.as_ref())?;
+        let beacon = beacon::Beacon::new(remote_entropy, local_entropy, &self.region_params)?;
         Ok(beacon)
     }
 
     /// Sends a gateway-to-gateway packet.
     ///
     /// See [`gateway::MessageSender::transmit_beacon`]
-    pub async fn send_beacon(&mut self, logger: &Logger) {
-        let beacon = match self.mk_beacon().await {
-            Ok(beacon) => beacon,
-            Err(err) => {
-                warn!(logger, "failed to construct beacon: {err:?}");
-                return;
-            }
-        };
+    pub async fn send_beacon(&mut self, beacon: beacon::Beacon) {
         let beacon_id = beacon.beacon_id();
-        info!(logger, "transmitting beacon"; "beacon" => &beacon_id);
-        let mut report = match poc_lora::LoraBeaconReportReqV1::try_from(beacon.clone()) {
-            Ok(report) => report,
-            Err(err) => {
-                warn!(logger, "failed to construct beacon report {err:?}");
-                return;
-            }
-        };
-        let (powe, tmst) = match self.transmit.transmit_beacon(beacon).await {
+        info!(beacon_id, "transmitting beacon");
+
+        let (powe, tmst) = match self.transmit.transmit_beacon(beacon.clone()).await {
             Ok(BeaconResp { powe, tmst }) => (powe, tmst),
             Err(err) => {
-                warn!(logger, "failed to transmit beacon {err:?}");
+                warn!(%err, "transmit beacon");
                 return;
             }
         };
-        report.tx_power = powe;
-        report.tmst = tmst;
-        let _ = PocLoraService::new(self.poc_ingest_uri.clone())
-            .submit_beacon(report, self.keypair.clone())
-            .inspect_err(|err| info!(logger, "failed to submit poc beacon report: {err:?}"; "beacon" => &beacon_id))
-            .inspect_ok(|_| info!(logger, "poc beacon report submitted"; "beacon" => &beacon_id))
+
+        self.last_beacon = Some(beacon.clone());
+
+        let report = match self.mk_beacon_report(beacon, powe, tmst).await {
+            Ok(report) => report,
+            Err(err) => {
+                warn!(beacon_id, %err, "poc beacon report");
+                return;
+            }
+        };
+        let _ = PocIotService::new(self.poc_ingest_uri.clone())
+            .submit_beacon(report)
+            .inspect_err(|err| info!(beacon_id, %err, "submit poc beacon report",))
+            .inspect_ok(|_| info!(beacon_id, "poc beacon report submitted",))
             .await;
     }
 
-    async fn handle_message(&mut self, message: Message, logger: &Logger) {
+    async fn handle_message(&mut self, message: Message) {
         match message {
-            Message::ReceivedBeacon(packet) => self.handle_received_beacon(packet, logger).await,
-            Message::ReceivedPacketSig(packet) => self.handle_packet_sig(packet, logger).await,
-            Message::RegionParamsChanged(region_params) => {
-                self.handle_region_params(region_params, logger)
-            }
+            Message::ReceivedBeacon(packet) => self.handle_received_beacon(packet).await,
+            Message::ReceivedPacketSig(packet) => self.handle_packet_sig(packet).await,
         }
     }
 
-    async fn handle_received_beacon(&mut self, packet: Packet, logger: &Logger) {
-        info!(logger, "received possible PoC payload: {packet:?}");
+    async fn mk_beacon_report(
+        &self,
+        beacon: beacon::Beacon,
+        conducted_power: i32,
+        tmst: u32,
+    ) -> Result<poc_lora::LoraBeaconReportReqV1> {
+        let mut report = poc_lora::LoraBeaconReportReqV1::try_from(beacon)?;
+        report.tx_power = conducted_power;
+        report.tmst = tmst;
+        report.pub_key = self.keypair.public_key().to_vec();
+        report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
+        Ok(report)
+    }
+
+    async fn mk_witness_report(
+        &self,
+        packet: PacketUp,
+    ) -> Result<poc_lora::LoraWitnessReportReqV1> {
+        let mut report = poc_lora::LoraWitnessReportReqV1::try_from(packet)?;
+        report.pub_key = self.keypair.public_key().to_vec();
+        report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
+        Ok(report)
+    }
+
+    async fn handle_beacon_tick(&mut self) {
+        match self.mk_beacon().await {
+            Ok(beacon) => {
+                self.send_beacon(beacon).await;
+                // On success just use the normal behavior for selecting a next
+                // beacon time. Can't be the first time since we have region
+                // parameters to construct a beacon
+                self.next_beacon_time = Self::mk_next_beacon_time(self.interval, false);
+            }
+            Err(err) => {
+                warn!(%err, "construct beacon");
+                // On failure to construct a beacon at all, select a shortened
+                // "first time" next beacon time
+                self.next_beacon_time = Self::mk_next_beacon_time(self.interval, true);
+            }
+        };
+    }
+
+    async fn handle_received_beacon(&mut self, packet: PacketUp) {
+
+        if let Some(last_beacon) = &self.last_beacon {
+            if packet.payload() == last_beacon.data {
+                info!("ignoring last self beacon witness");
+                return;
+            }
+        }
+
         if packet.is_secure_packet() {
             // Queue up secure packets and wait for their signatures to come in later
 
             if is_full(&self.secure_packets) {
                 // our packet stash is full, pop off oldest and submit
                 let old_packet = self.secure_packets.pop_front().unwrap();
-                self.submit_witness(old_packet, logger).await;
+                self.submit_witness(old_packet).await;
             }
             self.secure_packets.push_back(packet.clone());
         } else {
             // its not a secure packet so there will be no future signature
-            self.submit_witness(packet, logger).await;
+            self.submit_witness(packet).await;
         }
         
     }
 
-    async fn submit_witness(&mut self, packet: Packet, logger: &Logger) {
-        let mut report = match packet.to_witness_report() {
-            Ok(report) => report,
-            Err(err) => {
-                warn!(logger, "ignoring invalid witness report: {err:?}");
-                return;
-            }
-        };
+    async fn handle_packet_sig(&mut self, packet: semtech_udp::push_data_sig::Packet) {
+        info!( "received secure packet signature packet: {packet:?}");
 
-        report.pub_key = self.keypair.public_key().to_vec();
-        match report.sign(self.keypair.clone()).await {
-            Ok(signature) => report.signature = signature,
-            Err(err) => {
-                info!(logger, "failed to sign poc witness report {err:?}");
-                return;
-            }
-        };
-
-        let _ = PocLoraService::new(self.poc_ingest_uri.clone())
-            .submit_witness(report.clone())
-            .inspect_err(|err| info!(logger, "failed to submit poc witness report: {err:?}"; "beacon" => report.data.to_b64()))
-            .inspect_ok(|_| info!(logger, "poc witness report submitted"; "beacon" => report.data.to_b64()))
-            .await;
-    }
-
-    async fn handle_packet_sig(&mut self, packet: semtech_udp::push_data_sig::Packet, logger: &Logger) {
-        info!(logger, "received secure packet signature packet: {packet:?}");
-
-        match self.secure_packets.iter().position(|x| x.packet_key().map_or(false, |k| k == packet.data.key) ) {
+        match self.secure_packets.iter().position(|x| x.packet_id().map_or(false, |k| k == packet.data.key) ) {
             Some(i) => {
                 let mut poc_packet = self.secure_packets.remove(i).unwrap();
                 poc_packet.set_secure_sig(packet.data.sig);
-                self.submit_witness(poc_packet, logger).await;
+                self.submit_witness(poc_packet).await;
             }
 
-            None => warn!(logger, "can not find secure packet with key: {}", packet.data.key)
+            None => warn!("can not find secure packet with key: {}", packet.data.key)
         }
     }
 
-    fn handle_region_params(&mut self, params: RegionParams, logger: &Logger) {
-        self.region_params = Some(params);
-        info!(logger, "updated region";
-              "region" => RegionParams::to_string(&self.region_params));
+    async fn submit_witness(&mut self, packet: PacketUp) {
+        let report = match self.mk_witness_report(packet).await {
+            Ok(report) => report,
+            Err(err) => {
+                warn!(%err, "ignoring invalid witness report");
+                return;
+            }
+        };
+
+        let _ = PocIotService::new(self.poc_ingest_uri.clone())
+            .submit_witness(report.clone())
+            .inspect_err(|err| {
+                info!(
+                    beacon = report.data.to_b64(),
+                    %err,
+                    "submit poc witness report"
+                )
+            })
+            .inspect_ok(|_| {
+                info!(
+                    beacon = report.data.to_b64(),
+                    "poc witness report submitted"
+                )
+            })
+            .await;
+
+        // Disable secondary beacons until TTL is implemented
+        if false {
+            self.handle_secondary_beacon(report).await
+        }
     }
 
-    /// Enter `Beaconer`'s run loop.
-    ///
-    /// This routine is will run forever and only returns on error or
-    /// shut-down event (.e.g. Control-C, signal).
-    pub async fn run(&mut self, shutdown: Listener, logger: &Logger) -> Result {
-        let logger = logger.new(slog::o!("module" => "beacon"));
-        info!(logger, "starting");
+    async fn handle_secondary_beacon(&mut self, report: poc_lora::LoraWitnessReportReqV1) {
+        if self.region_params.check_valid().is_err() {
+            warn!("no region params for secondary beacon");
+            return;
+        };
 
-        let mut beacon_timer = time::interval(self.interval);
-
-        loop {
-            if shutdown.is_triggered() {
-                return Ok(());
-            }
-
-            tokio::select! {
-                _ = shutdown.clone() => {
-                    info!(logger, "shutting down");
-                    return Ok(())
-                },
-                _ = beacon_timer.tick() => self.send_beacon(&logger).await,
-                message = self.messages.recv() => match message {
-                    Some(message) => self.handle_message(message, &logger).await,
-                    None => {
-                        warn!(logger, "ignoring closed messgae channel");
-                    }
+        // check if hash of witness is below the "difficulty threshold" for a secondary beacon
+        // TODO provide a way to get this difficulty threshold from eg. the entropy server
+        let buf = report.encode_to_vec();
+        let threshold = 1855177858159416090;
+        // compare the hash of the witness report as a u64 to the difficulty threshold
+        // this is sort of a bitcoin-esque proof of work check insofar as as we're looking
+        // for hashes under a certain value. Because of the time constraints involved this
+        // should not be a 'mineable' check, but it provides a useful probabalistic way to
+        // allow for verifiable secondary beacons without any coordination.
+        let factor = xxh64(&buf, 0);
+        if factor < threshold {
+            let beacon = match beacon::Entropy::from_data(report.data.clone())
+                .and_then(|remote_entropy| {
+                    beacon::Entropy::from_data(buf)
+                        .map(|local_entropy| (remote_entropy, local_entropy))
+                })
+                .and_then(|(remote_entropy, local_entropy)| {
+                    beacon::Beacon::new(remote_entropy, local_entropy, &self.region_params)
+                }) {
+                Ok(beacon) => beacon,
+                Err(err) => {
+                    warn!(%err, "secondary beacon construction");
+                    return;
                 }
+            };
 
+            self.send_beacon(beacon).await
+        }
+    }
 
-            }
+    /// Construct a beacon time based on the interval and whether this is the
+    /// "first time" to beacon. The first beacon time is closed by in time
+    fn mk_next_beacon_time(interval: Duration, first_params: bool) -> Instant {
+        let now = Instant::now();
+        if first_params {
+            let max_jitter = (interval.as_secs() * BEACON_INTERVAL_JITTER_PERCENTAGE) / 100;
+            let jitter = OsRng.gen_range(0..=max_jitter);
+            now + Duration::from_secs(jitter)
+        } else {
+            now + interval
         }
     }
 }
