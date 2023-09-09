@@ -13,6 +13,7 @@ pub mod server;
 pub mod service;
 pub mod settings;
 pub mod sync;
+pub mod dbusruntime;
 
 mod api;
 mod traits;
@@ -23,6 +24,7 @@ pub use keyed_uri::KeyedUri;
 pub use keypair::{Keypair, PublicKey};
 pub use packet::{PacketDown, PacketUp};
 pub use settings::Settings;
+pub use dbusruntime::DBusRuntime;
 pub(crate) use traits::*;
 
 use futures::{Future as StdFuture, Stream as StdStream};

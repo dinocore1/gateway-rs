@@ -1,12 +1,12 @@
 use crate::{
     beaconer, packet, packet_router, region_watcher, sync, PacketDown, PacketUp, PublicKey,
-    RegionParams, Result, Settings,
+    RegionParams, Result, Settings, DBusRuntime,
 };
 use beacon::Beacon;
 use lorawan::PHYPayload;
 use semtech_udp::{
     pull_resp::{self, Time},
-    server_runtime::{Error as SemtechError, Event, UdpRuntime},
+    server_runtime::{Error as SemtechError, Event},
     tx_ack,
     tx_ack::Error as TxAckErr,
     CodingRate, MacAddress, Modulation,
@@ -65,7 +65,7 @@ pub struct Gateway {
     uplinks: packet_router::MessageSender,
     beacons: beaconer::MessageSender,
     downlink_mac: MacAddress,
-    udp_runtime: UdpRuntime,
+    dbus_runtime: DBusRuntime,
     listen_address: String,
     region_watch: region_watcher::MessageReceiver,
     region_params: RegionParams,
@@ -88,7 +88,7 @@ impl Gateway {
             beacons,
             downlink_mac: Default::default(),
             listen_address: settings.listen.clone(),
-            udp_runtime: UdpRuntime::new(&settings.listen).await.map_err(Box::new)?,
+            dbus_runtime: DBusRuntime::new().await?,
             region_watch,
             region_params,
         };
@@ -103,7 +103,7 @@ impl Gateway {
                     info!( "shutting down");
                     return Ok(())
                 },
-                event = self.udp_runtime.recv() =>
+                event = self.dbus_runtime.recv() =>
                     self.handle_udp_event(event).await?,
                 message = self.messages.recv() => match message {
                     Some(message) => self.handle_message(message).await,
@@ -226,7 +226,7 @@ impl Gateway {
             }
         };
 
-        let beacon_tx = self.udp_runtime.prepare_downlink(packet, self.downlink_mac);
+        let beacon_tx = self.dbus_runtime.prepare_downlink(packet, self.downlink_mac);
 
         tokio::spawn(async move {
             let beacon_id = beacon.beacon_id();
@@ -289,9 +289,9 @@ impl Gateway {
 
         let (mut downlink_rx1, mut downlink_rx2) = (
             // first downlink
-            self.udp_runtime.prepare_empty_downlink(self.downlink_mac),
+            self.dbus_runtime.prepare_empty_downlink(self.downlink_mac),
             // 2nd downlink window if requested by the router response
-            self.udp_runtime.prepare_empty_downlink(self.downlink_mac),
+            self.dbus_runtime.prepare_empty_downlink(self.downlink_mac),
         );
 
         let downlink_mac = self.downlink_mac;
