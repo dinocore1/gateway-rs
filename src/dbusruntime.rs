@@ -1,12 +1,13 @@
 
 use std::time::Duration;
 
-use loragw_hw::lib::{TxPkt, nlighten::types::FullRxPkt, CardId};
-use semtech_udp::{server_runtime::{Event}, MacAddress, pull_resp::{self, TxPk}};
+use loragw_hw::lib::{TxPkt, nlighten::types::FullRxPkt, CardId, CodingRate};
+use semtech_udp::{server_runtime::{Event, RxPk}, MacAddress, pull_resp::{self, TxPk}, push_data::RxPkV1};
 use serde::{Serialize, Deserialize};
 use zbus::{dbus_proxy, zvariant::Type};
 use tokio::sync::mpsc;
 use futures::prelude::*;
+use tracing::{debug, info, warn};
 
 
 #[dbus_proxy(
@@ -97,63 +98,105 @@ impl DBusRuntimeInner {
     }
 }
 
+
 pub struct DBusRuntime {
-    inner: DBusRuntimeInner,
+    dbus_connection: zbus::Connection,
+    proxy: LoraCardProxy<'static>,
+    rx_stream: RxStream<'static>,
 }
 
 impl DBusRuntime {
-    pub async fn new() -> crate::Result<Self> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+
+        let dbus_connection = zbus::ConnectionBuilder::system()?
+            .build()
+            .await?;
+
+        let proxy = LoraCardProxy::new(&dbus_connection).await?;
+        let rx_stream = proxy.receive_rx().await?;
 
         Ok(Self {
-            inner: DBusRuntimeInner::new().await.map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e))?,
+            dbus_connection,
+            proxy,
+            rx_stream,
         })
     }
 
     pub async fn recv(&mut self) -> Event {
-        loop {
-            let rx_stream = self.get_rx_stream();
-            if let Some(msg) = rx_stream.next().await {
-                
-            }
-        }
-        //let msg = self.rx_stream.next().await;
-        todo!()
+        let msg = self.rx_stream.next().await.unwrap();
+        let args = msg.args().unwrap();
+        let rx = args.rx.to_pkt().unwrap();
+        Event::PacketReceived(RxPk::V1(RxPkV1 {
+            chan: 0, // dont care
+            codr: convert_coding_rate(rx.pkt.codingrate),
+            data: Vec::from(rx.pkt.payload.as_slice()),
+            datr: convert_datarate(rx.pkt.datarate),
+            freq: to_mhz(rx.pkt.freq),
+            lsnr: rx.pkt.snr as f32 * 10_f32,
+            modu: semtech_udp::Modulation::LORA,
+            rfch: 0, // dont care,
+            rssi: rx.rssic as i32,
+            rssis: Some(rx.pkt.rssi as i32 / 10),
+            size: rx.pkt.payload.len() as u64,
+            stat: convert_crc(&rx),
+            tmst: rx.pkt.tmst,
+            time: convert_time(&rx),
+
+        }), MacAddress::nil())
+        
     }
 
-    pub fn prepare_downlink(&self, txpk: pull_resp::TxPk, mac: MacAddress) -> Downlink {
-        // let packet = txpk.map(|txpk| pull_resp::Packet {
-        //     random_token: rand::thread_rng().gen(),
-        //     data: pull_resp::Data::from_txpk(txpk),
-        // });
-
+    pub fn prepare_downlink(&self, txpk: TxPk, mac: MacAddress) -> Downlink {
         Downlink {
-            // mac,
-            // packet,
-            // sender: todo!(),
+            packet: Some(txpk),
         }
     }
 
     pub fn prepare_empty_downlink(&self, downlink_mac: MacAddress) -> Downlink {
-        todo!()
-    }
-
-    fn get_rx_stream(&mut self) -> &mut RxStream<'static> {
-        todo!()
+        Downlink { packet: None }
     }
 
     
 }
 
-pub struct Downlink {
 
+pub struct Downlink {
+    packet: Option<TxPk>,
 }
 
 impl Downlink {
     pub fn set_packet(&mut self, txpk: TxPk) {
-        todo!()
+        self.packet = Some(txpk);
     }
 
     pub async fn dispatch(self, timeout_duration: Option<Duration>) -> semtech_udp::server_runtime::Result<Option<u32>> {
         todo!()
     }
+}
+
+fn convert_coding_rate(dr: loragw_hw::lib::CodingRate) -> semtech_udp::CodingRate {
+    match dr {
+        CodingRate::CR_4_5 => semtech_udp::CodingRate::_4_5,
+        CodingRate::CR_4_6 => semtech_udp::CodingRate::_4_6,
+        CodingRate::CR_4_7 => semtech_udp::CodingRate::_4_7,
+        CodingRate::CR_4_8 => semtech_udp::CodingRate::_4_8,
+        CodingRate::OFF => semtech_udp::CodingRate::OFF,
+    }
+
+}
+
+fn convert_datarate(datarate: loragw_hw::lib::Datarate) -> semtech_udp::DataRate {
+    todo!()
+}
+
+fn to_mhz(hz: u32) -> f64 {
+    hz as f64 / 1_000_000_f64
+}
+
+fn convert_crc(rx: &FullRxPkt) -> semtech_udp::push_data::CRC {
+    todo!()
+}
+
+fn convert_time(rx: &FullRxPkt) -> Option<String> {
+    todo!()
 }
