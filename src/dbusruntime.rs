@@ -149,11 +149,15 @@ impl DBusRuntime {
     pub fn prepare_downlink(&self, txpk: TxPk, mac: MacAddress) -> Downlink {
         Downlink {
             packet: Some(txpk),
+            proxy: self.proxy.clone(),
         }
     }
 
     pub fn prepare_empty_downlink(&self, downlink_mac: MacAddress) -> Downlink {
-        Downlink { packet: None }
+        Downlink { 
+            packet: None,
+            proxy: self.proxy.clone(),
+        }
     }
 
     
@@ -162,6 +166,7 @@ impl DBusRuntime {
 
 pub struct Downlink {
     packet: Option<TxPk>,
+    proxy: LoraCardProxy<'static>,
 }
 
 impl Downlink {
@@ -170,7 +175,26 @@ impl Downlink {
     }
 
     pub async fn dispatch(self, timeout_duration: Option<Duration>) -> semtech_udp::server_runtime::Result<Option<u32>> {
+        if let Some(pkt) = self.packet {
+            let pkt = TxPkt {
+                freq_hz: (pkt.freq * 1_000_000_f64).round() as u32,
+                rf_chain: pkt.rfch as u8,
+                rf_power: pkt.powe as i8,
+                datarate: pkt.datr,
+                coderate: pkt.codr,
+                invert_pol: pkt.ipol,
+                preamble: pkt.prea,
+                no_crc: pkt.ncrc,
+                no_header: false,
+                payload: pkt.data,
+                tx_mode: convert_txmode(&pkt),
+                tx_tmst: pkt.time.tmms().unwrap_or(0),
+            };
+            self.proxy.send(pkt.into()).await;
+        }
+
         todo!()
+        
     }
 }
 
