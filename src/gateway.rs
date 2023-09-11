@@ -88,7 +88,7 @@ impl Gateway {
             beacons,
             downlink_mac: Default::default(),
             listen_address: settings.listen.clone(),
-            dbus_runtime: DBusRuntime::new().await?,
+            dbus_runtime: DBusRuntime::new().await.map_err(|e| crate::Error::custom(e.to_string()))?,
             region_watch,
             region_params,
         };
