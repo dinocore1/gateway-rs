@@ -78,7 +78,7 @@ helium-crypto = ">=0.8"
 time = { version = ">=0.3", features = ["std"] }
 zbus = { version = "3.13", default-features = false, features = ["tokio"] }
 loragw-hw = { git = "https://gitlab.com/nlighten-systems/pkt-forwarder.git", branch = "dbus" }
-borsh-serde = { git = "https://gitlab.com/nlighten-systems/nlighten-core-rust.git", branch = "dbus" }
+borsh-serde = { git = "https://gitlab.com/nlighten-systems/nlighten-core-rust.git" }
 
 [features]
 default = ["ecc608"]

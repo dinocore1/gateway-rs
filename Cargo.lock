@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "borsh-serde"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dbus#28b3379301f3d56391c2b37cee92dac6b710969d"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git#678c3bb81649fc6351dc527281e758e3b646f906"
 dependencies = [
  "heapless",
  "nlighten-io",
@@ -1623,7 +1623,7 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 [[package]]
 name = "loragw-hw"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dbus#8443562be3fdaf892f3af7235940723f66a733c6"
+source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dbus#fa1a676e3a99fd6084d650de2039c9bf17e089b0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1798,7 +1798,7 @@ dependencies = [
 [[package]]
 name = "nlighten"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dbus#28b3379301f3d56391c2b37cee92dac6b710969d"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git#678c3bb81649fc6351dc527281e758e3b646f906"
 dependencies = [
  "borsh-serde",
  "chrono",
@@ -1816,7 +1816,7 @@ dependencies = [
 [[package]]
 name = "nlighten-io"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dbus#28b3379301f3d56391c2b37cee92dac6b710969d"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git#678c3bb81649fc6351dc527281e758e3b646f906"
 dependencies = [
  "heapless",
 ]
