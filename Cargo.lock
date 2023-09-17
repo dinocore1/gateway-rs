@@ -39,6 +39,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
 
 [[package]]
+name = "aes"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac1f845298e95f983ff1944b728ae08b8cebab80d684f0a832ed0fc74dfa27e2"
+dependencies = [
+ "cfg-if 1.0.0",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
+name = "aeshash"
+version = "0.1.0"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+dependencies = [
+ "aes",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -513,10 +533,20 @@ dependencies = [
 [[package]]
 name = "borsh-serde"
 version = "0.1.0"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+dependencies = [
+ "heapless",
+ "nlighten-io 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
+ "serde",
+]
+
+[[package]]
+name = "borsh-serde"
+version = "0.1.0"
 source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git#678c3bb81649fc6351dc527281e758e3b646f906"
 dependencies = [
  "heapless",
- "nlighten-io",
+ "nlighten-io 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git)",
  "serde",
 ]
 
@@ -563,9 +593,6 @@ name = "bytes"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2bd12c1caf447e69cd4528f47f94d203fd2582878ecb9e9465484c4148a8223"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "cc"
@@ -604,6 +631,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "defd4e7873dbddba6c7c91e199c7fcb946abc4a6a4ac3195400bcfb01b5de877"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -1143,7 +1180,7 @@ dependencies = [
  "async-trait",
  "base64",
  "beacon",
- "borsh-serde",
+ "borsh-serde 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git)",
  "clap 4.4.3",
  "config",
  "exponential-backoff",
@@ -1491,6 +1528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0c10553d664a4d0bcff9f4215d0aac67a639cc68ef660840afe309b807bc9f5"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1623,13 +1669,12 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 [[package]]
 name = "loragw-hw"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dbus#fa1a676e3a99fd6084d650de2039c9bf17e089b0"
+source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dev#6f94286cac0a40e494778605040478c54447a8d1"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "bindgen 0.59.2",
- "borsh-serde",
+ "borsh-serde 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
  "bytes",
  "cc",
  "futures",
@@ -1637,13 +1682,14 @@ dependencies = [
  "log",
  "memcmp",
  "nlighten",
- "nlighten-io",
+ "nlighten-io 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
  "num-traits",
  "pin-project",
  "pub-sub",
  "queues",
  "ringbuffer",
  "serde",
+ "serde_bytes",
  "serde_json",
  "smallvec",
  "spidev",
@@ -1651,10 +1697,7 @@ dependencies = [
  "take-if",
  "thiserror",
  "tokio",
- "tokio-pipe",
  "tokio-stream",
- "tokio-util",
- "zvariant",
 ]
 
 [[package]]
@@ -1798,19 +1841,31 @@ dependencies = [
 [[package]]
 name = "nlighten"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git#678c3bb81649fc6351dc527281e758e3b646f906"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
 dependencies = [
- "borsh-serde",
+ "aeshash",
+ "borsh-serde 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
+ "bytes",
  "chrono",
  "digest 0.10.7",
  "ed25519-compact 2.0.3",
  "heapless",
  "int-enum",
- "nlighten-io",
+ "nlighten-io 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
  "regex",
+ "rust_decimal",
  "safe-regex",
  "serde",
+ "zbus",
  "zvariant",
+]
+
+[[package]]
+name = "nlighten-io"
+version = "0.1.0"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+dependencies = [
+ "heapless",
 ]
 
 [[package]]
@@ -2568,6 +2623,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_bytes"
+version = "0.11.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab33ec92f677585af6d88c65593ae2375adde54efdbf16d597f2cbc7a6d368ff"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_derive"
 version = "1.0.188"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3007,16 +3071,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-pipe"
-version = "0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f213a84bffbd61b8fa0ba8a044b4bbe35d471d0b518867181e82bd5c15542784"
-dependencies = [
- "libc",
- "tokio",
-]
-
-[[package]]
 name = "tokio-stream"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3035,12 +3089,8 @@ checksum = "806fe8c2c87eccc8b3267cbae29ed3ab2d0bd37fca70ab622e46aaa9375ddb7d"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
- "futures-util",
- "hashbrown 0.12.3",
  "pin-project-lite",
- "slab",
  "tokio",
  "tracing",
 ]

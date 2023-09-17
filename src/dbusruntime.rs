@@ -1,78 +1,13 @@
 
 use std::time::Duration;
 
-use loragw_hw::lib::{TxPkt, nlighten::types::FullRxPkt, CardId, CodingRate};
+use loragw_hw::lib::{nlighten::{types::{FullRxPkt, TxPkt}, dbus::{LoraCardProxy, RxStream, DBusTxPkt}, lora::Frequency}, CardId, CodingRate};
 use semtech_udp::{server_runtime::{Event, RxPk}, MacAddress, pull_resp::{self, TxPk}, push_data::RxPkV1};
 use serde::{Serialize, Deserialize};
 use zbus::{dbus_proxy, zvariant::Type};
 use tokio::sync::mpsc;
 use futures::prelude::*;
 use tracing::{debug, info, warn};
-
-
-#[dbus_proxy(
-    interface = "com.nlighten.LoraCard1",
-    default_service = "com.nlighten.LoraCard",
-    default_path = "/com/nlighten/LoraCard"
-)]
-trait LoraCard {
-    fn send(&self, pkt: DBusTxPkt) -> zbus::fdo::Result<()>;
-
-    fn sign(&self, data: Vec<u8>) -> zbus::fdo::Result<Vec<u8>>;
-
-    #[dbus_proxy(signal)]
-    fn rx(&self, rx: DBusFullRxPkt) -> zbus::Result<()>;
-
-    #[dbus_proxy(signal)]
-    fn rx_sig(&self, rx: loragw_hw::lib::RxSig) -> zbus::Result<()>;
-
-    #[dbus_proxy(property)]
-    fn eui(&self) -> zbus::fdo::Result<CardId>;
-
-    #[dbus_proxy(property)]
-    fn pub_key(&self) -> zbus::fdo::Result<Vec<u8>>;
-
-    #[dbus_proxy(property)]
-    fn firmware(&self) -> zbus::fdo::Result<u32>;
-
-    #[dbus_proxy(property)]
-    fn serial_num(&self) -> zbus::fdo::Result<u32>;
-
-}
-
-#[derive(Debug, Serialize, Deserialize, Type)]
-pub struct DBusTxPkt(Vec<u8>);
-
-impl From<TxPkt> for DBusTxPkt {
-    fn from(value: TxPkt) -> Self {
-        let mut buf = Vec::new();
-        borsh_serde::to_writer(&value, &mut buf).expect("no io error");
-        DBusTxPkt(buf)
-    }
-}
-
-impl DBusTxPkt {
-    pub fn to_pkt(self) -> Result<TxPkt, borsh_serde::Error> {
-        borsh_serde::de::from_bytes(&self.0)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Type)]
-pub struct DBusFullRxPkt(Vec<u8>);
-
-impl From<FullRxPkt> for DBusFullRxPkt {
-    fn from(value: FullRxPkt) -> Self {
-        let mut buf = Vec::new();
-        borsh_serde::to_writer(&value, &mut buf).expect("no io error");
-        DBusFullRxPkt(buf)
-    }
-}
-
-impl DBusFullRxPkt {
-    pub fn to_pkt(self) -> Result<FullRxPkt, borsh_serde::Error> {
-        borsh_serde::de::from_bytes(&self.0)
-    }
-}
 
 struct DBusRuntimeInner {
     dbus_connection: zbus::Connection,
@@ -125,21 +60,21 @@ impl DBusRuntime {
     pub async fn recv(&mut self) -> Event {
         let msg = self.rx_stream.next().await.unwrap();
         let args = msg.args().unwrap();
-        let rx = args.rx.to_pkt().unwrap();
+        let rx = args.rx.unwrap().unwrap();
         Event::PacketReceived(RxPk::V1(RxPkV1 {
             chan: 0, // dont care
-            codr: nl_to_st::convert_coding_rate(&rx.pkt.codingrate),
+            codr: nl_to_st::convert_coding_rate(&rx.pkt.rxmeta.coding_rate),
             data: Vec::from(rx.pkt.payload.as_slice()),
-            datr: nl_to_st::convert_datarate(&rx.pkt.datarate),
-            freq: to_mhz(rx.pkt.freq),
-            lsnr: rx.pkt.snr as f32 * 10_f32,
+            datr: nl_to_st::convert_datarate(&rx.pkt.rxmeta.datarate),
+            freq: to_mhz(rx.pkt.rxmeta.freq),
+            lsnr: rx.pkt.rxmeta.snr.to_db(),
             modu: semtech_udp::Modulation::LORA,
             rfch: 0, // dont care,
             rssi: rx.rssic as i32,
-            rssis: Some(rx.pkt.rssi as i32 / 10),
+            rssis: Some(rx.pkt.rxmeta.rssis.to_db().round() as i32),
             size: rx.pkt.payload.len() as u64,
             stat: nl_to_st::convert_crc(&rx),
-            tmst: rx.pkt.tmst,
+            tmst: rx.pkt.rxmeta.tmst,
             time: convert_time(&rx),
 
         }), MacAddress::nil())
@@ -186,13 +121,12 @@ impl Downlink {
                 preamble: pkt.prea.map(|x| x as u16),
                 no_crc: pkt.ncrc.unwrap_or(false),
                 no_header: false,
-                payload: pkt.data.as_ref().into(),
+                payload: loragw_hw::lib::nlighten::lora::Payload::from_slice(pkt.data.as_ref()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "packet"))?,
                 tx_mode: st_to_nl::convert_txmode(&pkt),
-                tx_tmst: pkt.get_tmst().unwrap_or(0), // TODO: properly handle send on timestamp and gps
             };
 
             // TODO: implement SemtechError::Ack(TxAckErr::TooEarly | TxAckErr::TooLate)
-            return match self.proxy.send(pkt.into()).await {
+            return match self.proxy.send(DBusTxPkt::wrap(&pkt)).await {
                 Ok(()) => Ok(None),
                 Err(e) => Err(semtech_udp::server_runtime::Error::SendTimeout),
             };
@@ -268,12 +202,12 @@ mod st_to_nl {
         }
     }
 
-    pub(crate) fn convert_txmode(pkt: &TxPk) -> loragw_hw::lib::TxMode {
+    pub(crate) fn convert_txmode(pkt: &TxPk) -> loragw_hw::lib::nlighten::types::TxMode {
         match pkt.is_immediate() {
-            true => loragw_hw::lib::TxMode::Immediate,
+            true => loragw_hw::lib::nlighten::types::TxMode::Immediate,
             false => match pkt.get_tmst() {
-                Some(tmst) => loragw_hw::lib::TxMode::Timestamped,
-                None => loragw_hw::lib::TxMode::OnGPS,
+                Some(tmst) => loragw_hw::lib::nlighten::types::TxMode::Timestamped(tmst),
+                None => loragw_hw::lib::nlighten::types::TxMode::OnGPS,
             }
         }
     }
@@ -300,14 +234,14 @@ mod st_to_nl {
     }
 }
 
-fn to_mhz(hz: u32) -> f64 {
-    hz as f64 / 1_000_000_f64
+fn to_mhz(hz: Frequency) -> f64 {
+    hz.to_mhz() as f64
 }
 
 
 
 fn convert_time(rx: &FullRxPkt) -> Option<String> {
-    match rx.pkt.gps_time {
+    match rx.pkt.rxmeta.gps_time {
         Some(gps_time) => Some(gps_time.as_utc().to_rfc3339()),
         None => None,
     }
