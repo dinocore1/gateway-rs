@@ -1,41 +1,13 @@
-
 use std::time::Duration;
 
-use loragw_hw::lib::{nlighten::{types::{FullRxPkt, TxPkt}, dbus::{LoraCardProxy, RxStream, DBusTxPkt, SendResult}, lora::Frequency}, CardId, CodingRate};
-use semtech_udp::{server_runtime::{Event, RxPk, Error}, MacAddress, pull_resp::{self, TxPk}, push_data::RxPkV1};
-use serde::{Serialize, Deserialize};
-use zbus::{dbus_proxy, zvariant::Type};
-use tokio::sync::mpsc;
+use loragw_hw::lib::{nlighten::{types::{FullRxPkt, TxPkt}, dbus::{LoraCardProxy, RxStream, DBusTxPkt, SendResult}, lora::Frequency}, CodingRate};
+use semtech_udp::{server_runtime::{Event, RxPk}, MacAddress, pull_resp::{TxPk}, push_data::RxPkV1};
+
 use futures::prelude::*;
-use tracing::{debug, info, warn};
-
-struct DBusRuntimeInner {
-    dbus_connection: zbus::Connection,
-    proxy: LoraCardProxy<'static>,
-    rx_stream: Option<RxStream<'static>>,
-}
-
-impl DBusRuntimeInner {
-
-    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let dbus_connection = zbus::ConnectionBuilder::system()?
-        .build()
-        .await?;
-
-        let proxy = LoraCardProxy::new(&dbus_connection).await?;
-        let rx_stream = Some(proxy.receive_rx().await?);
-
-        Ok(Self {
-            dbus_connection,
-            proxy,
-            rx_stream,
-        })
-    }
-}
 
 
 pub struct DBusRuntime {
-    dbus_connection: zbus::Connection,
+    _dbus_connection: zbus::Connection,
     proxy: LoraCardProxy<'static>,
     rx_stream: RxStream<'static>,
 }
@@ -51,7 +23,7 @@ impl DBusRuntime {
         let rx_stream = proxy.receive_rx().await?;
 
         Ok(Self {
-            dbus_connection,
+            _dbus_connection: dbus_connection,
             proxy,
             rx_stream,
         })
@@ -81,14 +53,14 @@ impl DBusRuntime {
         
     }
 
-    pub fn prepare_downlink(&self, txpk: TxPk, mac: MacAddress) -> Downlink {
+    pub fn prepare_downlink(&self, txpk: TxPk, _mac: MacAddress) -> Downlink {
         Downlink {
             packet: Some(txpk),
             proxy: self.proxy.clone(),
         }
     }
 
-    pub fn prepare_empty_downlink(&self, downlink_mac: MacAddress) -> Downlink {
+    pub fn prepare_empty_downlink(&self, _downlink_mac: MacAddress) -> Downlink {
         Downlink { 
             packet: None,
             proxy: self.proxy.clone(),
@@ -109,7 +81,7 @@ impl Downlink {
         self.packet = Some(txpk);
     }
 
-    pub async fn dispatch(self, timeout_duration: Option<Duration>) -> semtech_udp::server_runtime::Result<Option<u32>> {
+    pub async fn dispatch(self, _timeout_duration: Option<Duration>) -> semtech_udp::server_runtime::Result<Option<u32>> {
         if let Some(pkt) = self.packet {
             let pkt = TxPkt {
                 freq_hz: (pkt.freq * 1_000_000_f64).round() as u32,
@@ -129,7 +101,7 @@ impl Downlink {
                 Ok(SendResult::Ok) => Ok(None),
                 Ok(SendResult::ErrPacketCollision | SendResult::ErrTooEarly | SendResult::ErrTooLate | SendResult::ErrQueueFull) => Err(semtech_udp::server_runtime::Error::Ack(semtech_udp::tx_ack::Error::TooLate)),
                 Ok(SendResult::ErrIO) => Err(semtech_udp::server_runtime::Error::Ack(semtech_udp::tx_ack::Error::SendFail)),
-                Err(e) => Err(semtech_udp::server_runtime::Error::SendTimeout),
+                Err(_e) => Err(semtech_udp::server_runtime::Error::SendTimeout),
             };
         }
 
