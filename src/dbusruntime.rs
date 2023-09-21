@@ -1,8 +1,8 @@
 
 use std::time::Duration;
 
-use loragw_hw::lib::{nlighten::{types::{FullRxPkt, TxPkt}, dbus::{LoraCardProxy, RxStream, DBusTxPkt}, lora::Frequency}, CardId, CodingRate};
-use semtech_udp::{server_runtime::{Event, RxPk}, MacAddress, pull_resp::{self, TxPk}, push_data::RxPkV1};
+use loragw_hw::lib::{nlighten::{types::{FullRxPkt, TxPkt}, dbus::{LoraCardProxy, RxStream, DBusTxPkt, SendResult}, lora::Frequency}, CardId, CodingRate};
+use semtech_udp::{server_runtime::{Event, RxPk, Error}, MacAddress, pull_resp::{self, TxPk}, push_data::RxPkV1};
 use serde::{Serialize, Deserialize};
 use zbus::{dbus_proxy, zvariant::Type};
 use tokio::sync::mpsc;
@@ -125,9 +125,10 @@ impl Downlink {
                 tx_mode: st_to_nl::convert_txmode(&pkt),
             };
 
-            // TODO: implement SemtechError::Ack(TxAckErr::TooEarly | TxAckErr::TooLate)
             return match self.proxy.send(DBusTxPkt::wrap(&pkt)).await {
-                Ok(()) => Ok(None),
+                Ok(SendResult::Ok) => Ok(None),
+                Ok(SendResult::ErrPacketCollision | SendResult::ErrTooEarly | SendResult::ErrTooLate | SendResult::ErrQueueFull) => Err(semtech_udp::server_runtime::Error::Ack(semtech_udp::tx_ack::Error::TooLate)),
+                Ok(SendResult::ErrIO) => Err(semtech_udp::server_runtime::Error::Ack(semtech_udp::tx_ack::Error::SendFail)),
                 Err(e) => Err(semtech_udp::server_runtime::Error::SendTimeout),
             };
         }

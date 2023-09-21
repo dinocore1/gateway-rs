@@ -52,7 +52,7 @@ dependencies = [
 [[package]]
 name = "aeshash"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#66d4c370c881cff11fc62061186afba7084cf3b6"
 dependencies = [
  "aes",
  "digest 0.10.7",
@@ -533,7 +533,7 @@ dependencies = [
 [[package]]
 name = "borsh-serde"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#66d4c370c881cff11fc62061186afba7084cf3b6"
 dependencies = [
  "heapless",
  "nlighten-io 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
@@ -1669,7 +1669,7 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 [[package]]
 name = "loragw-hw"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dev#6f94286cac0a40e494778605040478c54447a8d1"
+source = "git+https://gitlab.com/nlighten-systems/pkt-forwarder.git?branch=dev#1061dd015bb6a02ca8f39a7ae475b62433a04996"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1841,7 +1841,7 @@ dependencies = [
 [[package]]
 name = "nlighten"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#66d4c370c881cff11fc62061186afba7084cf3b6"
 dependencies = [
  "aeshash",
  "borsh-serde 0.1.0 (git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev)",
@@ -1863,7 +1863,7 @@ dependencies = [
 [[package]]
 name = "nlighten-io"
 version = "0.1.0"
-source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#a5f73876552e6d54bc9328c79f1c91f53fc0eb67"
+source = "git+https://gitlab.com/nlighten-systems/nlighten-core-rust.git?branch=dev#66d4c370c881cff11fc62061186afba7084cf3b6"
 dependencies = [
  "heapless",
 ]
