@@ -1,19 +1,17 @@
 //! This module provides proof-of-coverage (PoC) beaconing support.
-
 use crate::{
-    error::DecodeError,
     gateway::{self, BeaconResp},
     message_cache::MessageCache,
     region_watcher,
-    service::{entropy::EntropyService, poc::PocIotService},
+    service::{entropy::EntropyService, poc::PocIotService, Reconnect},
     settings::Settings,
-    sign, sync, Base64, Keypair, PacketUp, PublicKey, RegionParams, Result,
+    sync, Base64, DecodeError, PacketUp, PublicKey, RegionParams, Result,
 };
 use futures::TryFutureExt;
-use helium_proto::{services::poc_lora, Message as ProtoMessage};
+use helium_proto::services::poc_lora::{self, lora_stream_response_v1};
 use http::Uri;
 use std::sync::Arc;
-use time::{Duration, Instant};
+use time::{Duration, Instant, OffsetDateTime};
 use tracing::{info, warn};
 
 /// Message types that can be sent to `Beaconer`'s inbox.
@@ -38,23 +36,24 @@ impl MessageSender {
 pub struct Beaconer {
     /// Beacon/Witness handling disabled
     disabled: bool,
-    /// keypair to sign reports with
-    keypair: Arc<Keypair>,
     /// gateway packet transmit message queue
     transmit: gateway::MessageSender,
     /// Our receive queue.
     messages: MessageReceiver,
+    /// Service to deliver PoC reports to
+    service: PocIotService,
+    /// Service reconnect trigger
+    reconnect: Reconnect,
     /// Region change queue
     region_watch: region_watcher::MessageReceiver,
     /// Beacon interval
     interval: Duration,
-    // Time next beacon attempt is o be made
-    next_beacon_time: Instant,
+    // Time next beacon attempt is to be made
+    next_beacon_time: Option<OffsetDateTime>,
     /// Last seen beacons
     last_seen: MessageCache<Vec<u8>>,
     /// Use for channel plan and FR parameters
-    region_params: RegionParams,
-    poc_ingest_uri: Uri,
+    region_params: Arc<RegionParams>,
     entropy_uri: Uri,
 }
 
@@ -66,27 +65,28 @@ impl Beaconer {
         transmit: gateway::MessageSender,
     ) -> Self {
         let interval = Duration::seconds(settings.poc.interval as i64);
-        let poc_ingest_uri = settings.poc.ingest_uri.clone();
         let entropy_uri = settings.poc.entropy_uri.clone();
-        let keypair = settings.keypair.clone();
-        let region_params = region_watcher::current_value(&region_watch);
+        let service = PocIotService::new(
+            "beaconer",
+            settings.poc.ingest_uri.clone(),
+            settings.keypair.clone(),
+        );
+        let reconnect = Reconnect::default();
+        let region_params = Arc::new(region_watcher::current_value(&region_watch));
         let disabled = settings.poc.disable;
 
         Self {
-            keypair,
             transmit,
             messages,
             region_watch,
             interval,
             last_seen: MessageCache::new(15),
-            // Set a beacon at least an interval out... arrival of region_params
-            // will recalculate this time and no arrival of region_params will
-            // cause the beacon to not occur
-            next_beacon_time: Instant::now() + interval,
+            next_beacon_time: None,
             region_params,
-            poc_ingest_uri,
+            service,
             entropy_uri,
             disabled,
+            reconnect,
         }
     }
 
@@ -94,8 +94,11 @@ impl Beaconer {
         info!(
             beacon_interval = self.interval.whole_seconds(),
             disabled = self.disabled,
+            uri = %self.service.uri,
             "starting"
         );
+
+        let mut next_beacon_instant = Instant::now() + self.interval;
 
         loop {
             tokio::select! {
@@ -103,9 +106,15 @@ impl Beaconer {
                     info!("shutting down");
                     return Ok(())
                 },
-                _ = tokio::time::sleep_until(self.next_beacon_time.into_inner().into()) => {
-                    self.handle_beacon_tick().await;
-                    self.next_beacon_time += self.interval;
+                _ = tokio::time::sleep_until(next_beacon_instant.into_inner().into()) => {
+                    // Check if beaconing is enabled and we have valid region params
+                    if !self.disabled && self.region_params.check_valid().is_ok() {
+                        self.handle_beacon_tick().await;
+                    }
+                    // sleep up to another interval period. A subsequent region
+                    // param update will adjust this back to a random offset in
+                    // the next valid window
+                    next_beacon_instant = Instant::now() + self.interval;
                 },
                 message = self.messages.recv() => match message {
                     Some(Message::ReceivedBeacon(packet)) => self.handle_received_beacon(packet).await,
@@ -115,55 +124,75 @@ impl Beaconer {
                 },
                 region_change = self.region_watch.changed() => match region_change {
                     Ok(()) => {
-                        // Recalculate beacon time based on if this
-                        // was the first time region params have
-                        // arrived.  Ensure that the next beacon
-                        // time is not the full interval if this is
-                        // not the first region change
-                        //
-                        // Do the first time check below before
-                        // region params are assigned
-                        let new_region_params = region_watcher::current_value(&self.region_watch);
-
-                        if self.region_params.params.is_empty() {
-                            // Calculate a random but deterministic time offset
-                            // for this hotspot's beacons
-                            let offset = mk_beacon_offset(self.keypair.public_key(), self.interval);
-                            // Get a delay for the first beacon based on the
-                            // deterministic offset and the timestamp in the
-                            // first region params. If there's an error
-                            // converting the region param timestamp the
-                            // calculated offset
-                            let delay = mk_first_beacon_delay(new_region_params.timestamp, self.interval, offset).unwrap_or(offset);
-                            info!(delay = delay.whole_seconds(), "first beacon");
-                            self.next_beacon_time = Instant::now() + delay;
+                        // Recalculate a potential next beacon time based on the
+                        // timestamp in the region parameters.
+                        let new_region_params = Arc::new(region_watcher::current_value(&self.region_watch));
+                        // new region params can come back with the unknown
+                        // region and empty region params. We don't accept
+                        // anything but a valid region param before we set a
+                        // beacon time
+                        if new_region_params.check_valid().is_err() {
+                            continue;
                         }
-                        self.region_params = region_watcher::current_value(&self.region_watch);
-                        info!(region = RegionParams::to_string(&self.region_params), "region updated");
+                        // If we can't parse the timestamp ignore the region change altogether
+                        let Ok(new_timestamp) = OffsetDateTime::from_unix_timestamp(new_region_params.timestamp as i64) else {
+                            continue;
+                        };
+
+                        // Calculate next beacon time
+                        let new_beacon_time = mk_next_beacon_time(
+                            new_timestamp,
+                            self.next_beacon_time,
+                            self.interval,
+                        );
+
+                        // Log next beacon time if changed
+                        if Some(new_beacon_time) != self.next_beacon_time {
+                            info!(beacon_time = %new_beacon_time, "next beacon time");
+                        }
+                        self.next_beacon_time = Some(new_beacon_time);
+                        next_beacon_instant = Instant::now() + (new_beacon_time - new_timestamp);
+
+                        // Reduce noise, log param change if they actually
+                        // changed
+                        if  self.region_params != new_region_params {
+                            info!(region = RegionParams::to_string(&new_region_params), "region updated");
+                        }
+                        self.region_params = new_region_params;
                     },
                     Err(_) => warn!("region watch disconnected"),
-                }
-
+                },
+                service_message = self.service.recv() => match service_message {
+                    Ok(lora_stream_response_v1::Response::Offer(message)) => {
+                        let session_result = self.handle_session_offer(message).await;
+                        if session_result.is_ok() {
+                            // (Re)set retry count to max to maximize time to
+                            // next disconnect from service
+                            self.reconnect.retry_count = self.reconnect.max_retries;
+                        } else {
+                            // Failed to handle session offer, disconnect
+                            self.service.disconnect();
+                        }
+                        self.reconnect.update_next_time(session_result.is_err());
+                    },
+                    Err(err) => {
+                        warn!(?err, "ingest error");
+                        self.reconnect.update_next_time(true);
+                    },
+                },
+                _ = self.reconnect.wait() => {
+                    let reconnect_result = self.handle_reconnect().await;
+                    self.reconnect.update_next_time(reconnect_result.is_err());
+                },
 
             }
         }
     }
 
-    pub async fn mk_beacon(&self) -> Result<beacon::Beacon> {
-        self.region_params.check_valid()?;
-
-        let mut entropy_service = EntropyService::new(self.entropy_uri.clone());
-        let remote_entropy = entropy_service.get_entropy().await?;
-        let local_entropy = beacon::Entropy::local()?;
-
-        let beacon = beacon::Beacon::new(remote_entropy, local_entropy, &self.region_params)?;
-        Ok(beacon)
-    }
-
     /// Sends a gateway-to-gateway packet.
     ///
     /// See [`gateway::MessageSender::transmit_beacon`]
-    pub async fn send_beacon(&self, beacon: beacon::Beacon) -> Result<beacon::Beacon> {
+    pub async fn send_beacon(&mut self, beacon: beacon::Beacon) -> Result<beacon::Beacon> {
         let beacon_id = beacon
             .beacon_data()
             .map(|data| data.to_b64())
@@ -178,59 +207,42 @@ impl Beaconer {
             .map_ok(|BeaconResp { powe, tmst }| (powe, tmst))
             .await?;
 
-        // Construct concurrent futures for connecting to the poc ingester and
-        // signing the report
-        let report_fut = self.mk_beacon_report(beacon.clone(), powe, tmst);
-        let service_fut = PocIotService::connect(self.poc_ingest_uri.clone());
-
-        match tokio::try_join!(report_fut, service_fut) {
-            Ok((report, mut poc_service)) => {
-                poc_service
-                    .submit_beacon(report)
-                    .inspect_err(|err| warn!(beacon_id, %err, "submit poc beacon report"))
-                    .inspect_ok(|_| info!(beacon_id, "poc beacon report submitted"))
-                    .await?
-            }
-            Err(err) => {
-                warn!(beacon_id, %err, "poc beacon report");
-            }
-        }
+        Self::mk_beacon_report(
+            beacon.clone(),
+            powe,
+            tmst,
+            self.service.gateway_key().clone(),
+        )
+        .and_then(|report| self.service.submit_beacon(report))
+        .inspect_err(|err| warn!(beacon_id, %err, "submit poc beacon report"))
+        .inspect_ok(|_| info!(beacon_id, "poc beacon report submitted"))
+        .await?;
 
         Ok(beacon)
     }
 
-    async fn mk_beacon_report(
-        &self,
-        beacon: beacon::Beacon,
-        conducted_power: i32,
-        tmst: u32,
-    ) -> Result<poc_lora::LoraBeaconReportReqV1> {
-        let mut report = poc_lora::LoraBeaconReportReqV1::try_from(beacon)?;
-        report.tx_power = conducted_power;
-        report.tmst = tmst;
-        report.pub_key = self.keypair.public_key().to_vec();
-        report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
-        Ok(report)
+    async fn handle_session_offer(
+        &mut self,
+        message: poc_lora::LoraStreamSessionOfferV1,
+    ) -> Result {
+        self.service.session_init(&message.nonce).await
     }
 
-    async fn mk_witness_report(
-        &self,
-        packet: PacketUp,
-        payload: Vec<u8>,
-    ) -> Result<poc_lora::LoraWitnessReportReqV1> {
-        let mut report = poc_lora::LoraWitnessReportReqV1::try_from(packet)?;
-        report.data = payload;
-        report.pub_key = self.keypair.public_key().to_vec();
-        report.signature = sign(self.keypair.clone(), report.encode_to_vec()).await?;
-        Ok(report)
+    async fn handle_reconnect(&mut self) -> Result {
+        // Do not send waiting reports on ok here since we wait for a session
+        // offer. Also do not reset the reconnect retry counter since only a
+        // session key indicates a good connection
+        self.service
+            .reconnect()
+            .inspect_err(|err| warn!(%err, "failed to reconnect"))
+            .await
     }
 
     async fn handle_beacon_tick(&mut self) {
-        if self.disabled {
-            return;
-        }
-        let last_beacon = self
-            .mk_beacon()
+        // Need to clone to allow the subsequence borrow of self for send_beacon.
+        // The Arc around the region_params makes this a cheap clone
+        let region_params = self.region_params.clone();
+        let last_beacon = Self::mk_beacon(&region_params, self.entropy_uri.clone())
             .inspect_err(|err| warn!(%err, "construct beacon"))
             .and_then(|beacon| self.send_beacon(beacon))
             .map_ok_or_else(|_| None, Some)
@@ -261,55 +273,87 @@ impl Beaconer {
             return;
         }
 
-        // Construct concurrent futures for connecting to the poc ingester and
-        // signing the report
-        let report_fut = self.mk_witness_report(packet, beacon_data);
-        let service_fut = PocIotService::connect(self.poc_ingest_uri.clone());
+        let _ = Self::mk_witness_report(packet, beacon_data, self.service.gateway_key().clone())
+            .and_then(|report| self.service.submit_witness(report))
+            .inspect_err(|err| warn!(beacon_id, %err, "submit poc witness report"))
+            .inspect_ok(|_| info!(beacon_id, "poc witness report submitted"))
+            .await;
+    }
 
-        match tokio::try_join!(report_fut, service_fut) {
-            Ok((report, mut poc_service)) => {
-                let _ = poc_service
-                    .submit_witness(report)
-                    .inspect_err(|err| warn!(beacon_id, %err, "submit poc witness report"))
-                    .inspect_ok(|_| info!(beacon_id, "poc witness report submitted"))
-                    .await;
-            }
-            Err(err) => {
-                warn!(%err, "poc witness report");
-            }
-        }
+    pub async fn mk_beacon(
+        region_params: &RegionParams,
+        entropy_uri: Uri,
+    ) -> Result<beacon::Beacon> {
+        region_params.check_valid()?;
+
+        let mut entropy_service = EntropyService::new(entropy_uri);
+        let remote_entropy = entropy_service.get_entropy().await?;
+        let local_entropy = beacon::Entropy::local()?;
+
+        let beacon = beacon::Beacon::new(remote_entropy, local_entropy, region_params)?;
+        Ok(beacon)
+    }
+
+    async fn mk_beacon_report(
+        beacon: beacon::Beacon,
+        conducted_power: i32,
+        tmst: u32,
+        gateway: PublicKey,
+    ) -> Result<poc_lora::LoraBeaconReportReqV1> {
+        let mut report = poc_lora::LoraBeaconReportReqV1::try_from(beacon)?;
+        report.pub_key = gateway.to_vec();
+        report.tx_power = conducted_power;
+        report.tmst = tmst;
+        Ok(report)
+    }
+
+    async fn mk_witness_report(
+        packet: PacketUp,
+        payload: Vec<u8>,
+        gateway: PublicKey,
+    ) -> Result<poc_lora::LoraWitnessReportReqV1> {
+        let mut report = poc_lora::LoraWitnessReportReqV1::try_from(packet)?;
+        report.pub_key = gateway.to_vec();
+        report.data = payload;
+        Ok(report)
     }
 }
 
-/// Construct a random but deterministic offset for beaconing. This is based on
-/// the public key as of this hotspot as the seed to a random number generator.
-fn mk_beacon_offset(key: &PublicKey, interval: Duration) -> Duration {
-    use rand::{Rng, SeedableRng};
-    use sha2::Digest;
-
-    let hash = sha2::Sha256::digest(key.to_vec());
-    let mut rng = rand::rngs::StdRng::from_seed(*hash.as_ref());
-    Duration::seconds(rng.gen_range(0..interval.whole_seconds()))
+fn random_duration(duration: Duration) -> Duration {
+    use rand::{rngs::OsRng, Rng};
+    Duration::seconds(OsRng.gen_range(0..duration.whole_seconds()))
 }
 
-/// Construct the first beacon time. This positions the given offset in the next
-/// interval based wall clock segment. It returns the time to sleep until that
-/// determinstic offset in the current or next segment.
-fn mk_first_beacon_delay(
-    current_time: u64,
+fn mk_next_beacon_time(
+    current_time: OffsetDateTime,
+    beacon_time: Option<OffsetDateTime>,
     interval: Duration,
-    offset: Duration,
-) -> Option<Duration> {
-    time::OffsetDateTime::from_unix_timestamp(current_time as i64)
-        .map(|now| {
-            let current_segment = duration_trunc(now, interval);
-            let mut first_time = current_segment + offset;
-            if first_time < now {
-                first_time += interval;
+) -> OffsetDateTime {
+    let current_segment = duration_trunc(current_time, interval);
+    let next_segment = current_segment + interval;
+    match beacon_time {
+        // beacon time is in the future, just use it
+        Some(beacon_time) if beacon_time > current_time => beacon_time,
+        // beacon time is in the past, either in the current or previous segment
+        Some(beacon_time) => {
+            let beacon_segment = duration_trunc(beacon_time, interval);
+            if beacon_segment == current_segment {
+                // current segment: pick a time in the next segment
+                next_segment + random_duration(interval)
+            } else {
+                // previous segment: Pick a time in the remainder of this
+                // segment. This really only happens as the current time enters
+                // a new segment
+                current_time + random_duration(next_segment - current_time)
             }
-            first_time - now
-        })
-        .ok()
+        }
+        // No next beacon time pick a random time in this segment as the beacon
+        // time and use this function again
+        None => {
+            let beacon_time = current_segment + random_duration(interval);
+            mk_next_beacon_time(current_time, Some(beacon_time), interval)
+        }
+    }
 }
 
 /// Return a the given time truncated to the nearest duration. Based on
@@ -365,54 +409,58 @@ mod test {
     }
 
     #[test]
-    fn test_beacon_offset() {
-        use super::mk_beacon_offset;
-        use std::str::FromStr;
-
-        const PUBKEY_1: &str = "13WvV82S7QN3VMzMSieiGxvuaPKknMtf213E5JwPnboDkUfesKw";
-        const PUBKEY_2: &str = "14HZVR4bdF9QMowYxWrumcFBNfWnhDdD5XXA5za1fWwUhHxxFS1";
-        let pubkey_1 = helium_crypto::PublicKey::from_str(PUBKEY_1).expect("public key");
-        let offset_1 = mk_beacon_offset(&pubkey_1, time::Duration::hours(6));
-        // Same key and interval should always end up at the same offset
-        assert_eq!(
-            offset_1,
-            mk_beacon_offset(&pubkey_1, time::Duration::hours(6))
-        );
-        let pubkey_2 = helium_crypto::PublicKey::from_str(PUBKEY_2).expect("public key 2");
-        let offset_2 = mk_beacon_offset(&pubkey_2, time::Duration::hours(6));
-        assert_eq!(
-            offset_2,
-            mk_beacon_offset(&pubkey_2, time::Duration::hours(6))
-        );
-        // And two offsets based on different keys should not land at the same
-        // offset
-        assert_ne!(offset_1, offset_2);
-    }
-
-    #[test]
-    fn test_beacon_first_time() {
-        use super::mk_first_beacon_delay;
+    fn test_beacon_time() {
+        use super::{duration_trunc, mk_next_beacon_time};
         use time::{macros::datetime, Duration};
 
         let interval = Duration::hours(6);
-        let early_offset = Duration::minutes(10);
-        let late_offset = early_offset + Duration::hours(5);
-
         let current_time = datetime!(2023-09-01 09:20 UTC);
-        let early_sleep =
-            mk_first_beacon_delay(current_time.unix_timestamp() as u64, interval, early_offset)
-                .unwrap_or(early_offset);
-        let late_sleep =
-            mk_first_beacon_delay(current_time.unix_timestamp() as u64, interval, late_offset)
-                .unwrap_or(late_offset);
 
-        assert_eq!(
-            datetime!(2023-09-01 12:10:00 UTC),
-            current_time + early_sleep
-        );
-        assert_eq!(
-            datetime!(2023-09-01 11:10:00 UTC),
-            current_time + late_sleep
-        );
+        let current_segment = duration_trunc(current_time, interval);
+        let next_segment = current_segment + interval;
+        assert!(current_time < next_segment);
+
+        // No beacon time, should pick a time in the remainder of
+        // the current segment or in the next segment
+        {
+            let next_time = mk_next_beacon_time(current_time, None, interval);
+            assert!(next_time > current_time);
+            assert!(next_time < next_segment + interval);
+        }
+
+        // Beacon time in the future
+        {
+            // In this segment
+            let beacon_time = current_time + Duration::minutes(10);
+            assert_eq!(current_segment, duration_trunc(beacon_time, interval));
+            let next_time = mk_next_beacon_time(current_time, Some(beacon_time), interval);
+            assert!(next_time > current_time);
+            assert!(next_time < next_segment);
+            assert_eq!(current_segment, duration_trunc(next_time, interval));
+            // In the next segment
+            let beacon_time = next_segment + Duration::minutes(10);
+            let next_time = mk_next_beacon_time(current_time, Some(beacon_time), interval);
+            assert!(next_time > current_time);
+            assert!(next_time > next_segment);
+            assert_eq!(next_segment, duration_trunc(next_time, interval));
+        }
+
+        // Beacon time in the past
+        {
+            // This segment, should pick a time in the next segment
+            let beacon_time = current_segment + Duration::minutes(10);
+            assert!(beacon_time < current_time);
+            assert_eq!(current_segment, duration_trunc(beacon_time, interval));
+            let next_time = mk_next_beacon_time(current_time, Some(beacon_time), interval);
+            assert!(next_time > current_time);
+            assert_eq!(next_segment, duration_trunc(next_time, interval));
+
+            // Previous segment, should pick a time in this segment
+            let beacon_time = current_segment - Duration::minutes(10);
+            let next_time = mk_next_beacon_time(current_time, Some(beacon_time), interval);
+            assert!(next_time > current_time);
+            assert!(next_time < next_segment);
+            assert_eq!(current_segment, duration_trunc(next_time, interval));
+        }
     }
 }

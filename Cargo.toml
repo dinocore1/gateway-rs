@@ -1,7 +1,7 @@
 [package]
 name = "gateway-rs"
 description = "Helium Gateway for LoRa packet forwarders"
-version = "1.1.1"
+version = "1.3.0"
 authors = ["Marc Nijdam <marc@helium.com>"]
 edition = "2021"
 license = "Apache-2.0"
@@ -34,6 +34,7 @@ clap = { version = "4", default-features = false, features = [
     "std",
     "error-context",
 ] }
+bs58 = "0"
 semver = "0"
 config = { version = "0", default-features = false, features = ["toml"] }
 serde = { workspace = true }
@@ -74,7 +75,7 @@ exponential-backoff = { git = "https://github.com/yoshuawuyts/exponential-backof
 semtech-udp = { version = ">=0.11", default-features = false, features = [
     "server",
 ] }
-helium-crypto = ">=0.8"
+helium-crypto = ">=0.8.3"
 time = { version = ">=0.3", features = ["std"] }
 zbus = { version = "3.13", default-features = false, features = ["tokio"] }
 loragw-hw = { git = "https://gitlab.com/nlighten-systems/pkt-forwarder.git", branch = "dev" }

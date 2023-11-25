@@ -1,6 +1,6 @@
 use crate::{
-    beaconer, packet, packet_router, region_watcher, sync, PacketDown, PacketUp, PublicKey,
-    RegionParams, Result, Settings, DBusRuntime,
+    beaconer, packet, packet_router, region_watcher, sync, DecodeError, Error, PacketDown,
+    PacketUp, PublicKey, RegionParams, Result, Settings, DBusRuntime
 };
 use beacon::Beacon;
 use lorawan::PHYPayload;
@@ -114,8 +114,13 @@ impl Gateway {
                 },
                 region_change = self.region_watch.changed() => match region_change {
                     Ok(()) => {
-                        self.region_params = region_watcher::current_value(&self.region_watch);
-                        info!(region = RegionParams::to_string(&self.region_params), "region updated");
+                        let new_region_params = region_watcher::current_value(&self.region_watch);
+                        // Only log if region parameters have changed to avoid
+                        // log noise
+                        if self.region_params != new_region_params {
+                            info!(region = RegionParams::to_string(&new_region_params), "region updated");
+                        }
+                        self.region_params = new_region_params;
                     }
                     Err(_) => warn!("region watch disconnected")
                 },
@@ -148,6 +153,12 @@ impl Gateway {
                     }
                     Ok(packet) => {
                         info!(%packet, "ignoring non-uplink packet");
+                    }
+                    Err(Error::Decode(DecodeError::CrcDisabled)) => {
+                        debug!("ignoring packet with disabled crc");
+                    }
+                    Err(Error::Decode(DecodeError::InvalidDataRate(datarate))) => {
+                        debug!(%datarate, "ignoring packet with invalid datarate");
                     }
                     Err(err) => {
                         warn!(%err, "ignoring push_data");
